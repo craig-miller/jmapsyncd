@@ -10,7 +10,7 @@ toml = "0.8"
 anyhow = "1"
 dirs = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
-jmap-client = "0.2"
+jmap-client = "0.4"
 notify = "7"
 maildir = "0.4"
 globset = "0.4"
