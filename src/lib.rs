@@ -6,7 +6,4 @@ pub mod db;
 
 pub mod jmap;
 
-pub mod sync {
-    pub mod mailbox;
-    pub mod email;
-}
+pub mod sync;
