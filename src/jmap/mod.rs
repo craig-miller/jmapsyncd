@@ -7,7 +7,13 @@ pub async fn client_from_account(acct: &Account) -> Result<Client> {
     let token = resolve_token(&acct.token)
         .with_context(|| format!("resolving JMAP token for account {:?}", acct.name))?;
 
-    let url = format!("https://{}", acct.jmap_host);
+    // If jmap_host already has a scheme (dev/testing: http://127.0.0.1:...),
+    // use it verbatim; otherwise default to https:// for production.
+    let url = if acct.jmap_host.starts_with("http://") || acct.jmap_host.starts_with("https://") {
+        acct.jmap_host.clone()
+    } else {
+        format!("https://{}", acct.jmap_host)
+    };
 
     Client::new()
         .credentials(Credentials::Bearer(token))

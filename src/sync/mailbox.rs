@@ -453,7 +453,7 @@ fn cleanup_orphaned_emails(db: &Database, mail_root: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BoxMapping, MailConfig, SyncMode};
+    use crate::config::{MailConfig, SyncMode};
     use crate::db::models::EmailRow;
     use std::path::PathBuf;
 

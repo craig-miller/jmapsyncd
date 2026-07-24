@@ -1152,6 +1152,7 @@ dependencies = [
  "serde_rusqlite",
  "shellexpand",
  "tempfile",
+ "tokio",
  "toml",
  "uuid",
  "wiremock",
