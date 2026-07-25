@@ -250,3 +250,101 @@ async fn run_daemon_inner(config: Config) -> anyhow::Result<()> {
     log::info!("all account tasks exited; daemon done");
     Ok(())
 }
+/// One-shot sync: bring up every enabled account (or just the named one),
+/// run `sync_account` once each, then exit. Reuses the same per-account
+/// bring-up plumbing as `run_daemon` (Database open + client build), but
+/// no SSE loop, no cancel token, no signal wait.
+///
+/// Returns `Err` if any per-account sync errored, or if `account_filter`
+/// is set and matches no enabled account. Per-account bring-up failures
+/// (bad db path, bad JMAP token) are logged and skipped; only the sync
+/// pass itself counts against the error tally — same policy as
+/// `run_daemon` for bring-up, stricter for the sync itself since a
+/// one-shot is meant to succeed or fail visibly.
+pub async fn run_sync_once(config: Config, account_filter: Option<&str>) -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    local
+        .run_until(run_sync_once_inner(config, account_filter))
+        .await
+}
+
+async fn run_sync_once_inner(
+    config: Config,
+    account_filter: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut matched = 0usize;
+    let mut errors = 0usize;
+
+    for acct in config.accounts.into_iter().filter(|a| a.enabled) {
+        if let Some(name) = account_filter {
+            if acct.name != name {
+                continue;
+            }
+        }
+        matched += 1;
+
+        if acct.mail.is_none() {
+            log::warn!(
+                "[{}] no [accounts.mail] section; skipping (nothing to sync to)",
+                acct.name
+            );
+            continue;
+        }
+
+        let db_path = config.db_dir.join(format!("{}.sqlite", acct.name));
+        if let Some(parent) = db_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::error!(
+                    "[{}] cannot create db_dir {}: {e}; skipping account",
+                    acct.name,
+                    parent.display()
+                );
+                continue;
+            }
+        }
+        let db = match crate::db::Database::open(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!(
+                    "[{}] failed to open database at {}: {e:#}; skipping account",
+                    acct.name,
+                    db_path.display()
+                );
+                continue;
+            }
+        };
+
+        let client = match crate::jmap::client_from_account(&acct).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!(
+                    "[{}] failed to authenticate JMAP client: {e:#}; skipping account",
+                    acct.name
+                );
+                continue;
+            }
+        };
+
+        match sync::sync_account(&client, &acct, &db).await {
+            Ok(_) => {}
+            Err(e) => {
+                log::error!("[{}] sync failed: {e:#}", acct.name);
+                errors += 1;
+            }
+        }
+    }
+
+    if let Some(name) = account_filter {
+        if matched == 0 {
+            anyhow::bail!("no enabled account named {name:?}");
+        }
+    } else if matched == 0 {
+        anyhow::bail!("no enabled accounts to sync");
+    }
+
+    if errors > 0 {
+        anyhow::bail!("{errors} account sync(s) failed");
+    }
+
+    Ok(())
+}

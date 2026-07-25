@@ -17,15 +17,16 @@ async fn main() -> std::process::ExitCode {
 
     match command {
         jmapsyncd::args::Command::Sync { account } => {
-            match account {
-                None => log::info!("syncing all accounts"),
-                Some(account) => log::info!("syncing account: {:?}", account),
-            }
             if args.dry_run {
-                log::info!("dry-run mode, no changes will be applied");
+                log::warn!("--dry-run not yet wired through the sync engine; running as normal sync");
             }
-            // Sync one-shot handled in Phase C.4; stub for now.
-            std::process::ExitCode::SUCCESS
+            match jmapsyncd::daemon::run_sync_once(config, account.as_deref()).await {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    log::error!("sync exited with error: {e:#}");
+                    std::process::ExitCode::from(1)
+                }
+            }
         }
         jmapsyncd::args::Command::Daemon => {
             if args.dry_run {
