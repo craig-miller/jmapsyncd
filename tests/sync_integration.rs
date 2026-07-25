@@ -246,6 +246,7 @@ fn build_account(jmap_host: &str, mail_path: PathBuf) -> Account {
             jmap_token: "test-token".to_string(),
         },
         timeout_secs: 30,
+        poll_interval_secs: 0,
         mail: Some(MailConfig {
             path: mail_path,
             sync_mode: SyncMode::Mirror,

@@ -80,6 +80,8 @@ pub struct Account {
     pub token: TokenSource,
     #[serde(default = "helpers::default_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default = "helpers::default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
     pub mail: Option<MailConfig>,
 }
 
@@ -201,6 +203,10 @@ pub(crate) mod helpers {
 
     pub fn default_timeout_secs() -> u64 {
         30
+    }
+
+    pub fn default_poll_interval_secs() -> u64 {
+        300
     }
 }
 
@@ -640,5 +646,36 @@ jmap_token = "t"
         let overrides = Overrides { db_dir: None };
         let result = Config::load(None, &overrides);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn poll_interval_defaults_to_300() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.accounts[0].poll_interval_secs, 300);
+    }
+
+    #[test]
+    fn poll_interval_explicit_override() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+poll_interval_secs = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.accounts[0].poll_interval_secs, 0);
     }
 }

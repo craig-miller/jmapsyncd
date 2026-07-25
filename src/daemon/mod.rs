@@ -67,12 +67,32 @@ pub async fn run_account_sse_loop(
 
         info!("[{acct_name}] SSE connected");
 
+        // Polling fallback timer — fires every poll_interval_secs while
+        // SSE is up but silent. When SSE fires reliably, these ticks are
+        // redundant no-ops. Zero disables. `interval.tick()` fires
+        // immediately by default; consume that so the first real tick
+        // happens after `poll_interval_secs`, not on entry.
+        let mut poll_interval = if acct.poll_interval_secs > 0 {
+            let mut i = tokio::time::interval(Duration::from_secs(acct.poll_interval_secs));
+            i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            i.tick().await;
+            Some(i)
+        } else {
+            None
+        };
+
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     info!("[{acct_name}] cancel received mid-stream; SSE loop exiting");
                     return;
+                }
+                _ = maybe_tick(poll_interval.as_mut()) => {
+                    debug!("[{acct_name}] poll timer fired; triggering sync");
+                    if let Err(e) = sync::sync_account(&client, &acct, &db).await {
+                        error!("[{acct_name}] poll-triggered sync failed: {e:#}");
+                    }
                 }
                 item = stream.next() => {
                     match item {
@@ -103,6 +123,18 @@ pub async fn run_account_sse_loop(
         }
 
         sleep_or_cancel(SSE_STREAM_DROP_BACKOFF, &cancel).await;
+    }
+}
+
+/// Wait for the next tick of an optional interval. When `interval` is
+/// None (polling disabled), this future never resolves — the select! arm
+/// becomes inert without conditional compilation.
+async fn maybe_tick(interval: Option<&mut tokio::time::Interval>) {
+    match interval {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
