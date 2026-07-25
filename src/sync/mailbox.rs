@@ -22,6 +22,7 @@ pub async fn sync_mailboxes(
     client: &Client,
     db: &Database,
     acct: &Account,
+    dry_run: bool,
 ) -> Result<Vec<MailboxRow>> {
     let mail_cfg = acct
         .mail
@@ -41,14 +42,24 @@ pub async fn sync_mailboxes(
         .filter_map(|m| m.jmap_id.clone().map(|j| (j, m.clone())))
         .collect();
 
-    let mut stats = apply_diff(db, &mail_cfg.path, &target_set, &local_by_jmap)?;
-    stats.orphaned_emails = cleanup_orphaned_emails(db, &mail_cfg.path)?;
+    let mut stats =
+        apply_diff(db, &mail_cfg.path, &target_set, &local_by_jmap, dry_run)?;
+    stats.orphaned_emails = cleanup_orphaned_emails(db, &mail_cfg.path, dry_run)?;
 
     info!(
-        "[{}] mailbox sync: {} created, {} updated, {} deleted, {} orphaned emails cleaned",
-        acct.name, stats.created, stats.updated, stats.deleted, stats.orphaned_emails,
+        "[{}] {}mailbox sync: {} created, {} updated, {} deleted, {} orphaned emails cleaned",
+        acct.name,
+        if dry_run { "[dry-run] " } else { "" },
+        stats.created,
+        stats.updated,
+        stats.deleted,
+        stats.orphaned_emails,
     );
 
+    // Under dry-run the DB is unchanged, so returning the pre-sync tree
+    // is correct — sync_emails downstream then walks against the current
+    // (unmutated) mailbox set. Under real sync the DB has just been
+    // updated so re-fetching picks up the new state.
     db.get_all_mailboxes()
 }
 
@@ -212,6 +223,7 @@ fn apply_diff(
     mail_root: &Path,
     target: &HashMap<String, TargetMailbox>,
     local_by_jmap: &HashMap<String, MailboxRow>,
+    dry_run: bool,
 ) -> Result<MailboxSyncStats> {
     let mut stats = MailboxSyncStats::default();
 
@@ -227,7 +239,7 @@ fn apply_diff(
     // Deepest paths first — parents can only be removed after their children.
     to_delete.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
     for row in to_delete {
-        delete_mailbox(db, mail_root, row)?;
+        delete_mailbox(db, mail_root, row, dry_run)?;
         stats.deleted += 1;
     }
 
@@ -238,14 +250,14 @@ fn apply_diff(
         let tgt = &target[&jmap_id];
         match local_by_jmap.get(&jmap_id) {
             None => {
-                create_mailbox(db, mail_root, tgt, local_by_jmap)?;
+                create_mailbox(db, mail_root, tgt, local_by_jmap, dry_run)?;
                 stats.created += 1;
             }
             Some(existing) => {
                 if let Some(new_row) =
                     diff_and_build_update(existing, tgt, local_by_jmap)
                 {
-                    update_mailbox(db, mail_root, existing, &new_row)?;
+                    update_mailbox(db, mail_root, existing, &new_row, dry_run)?;
                     stats.updated += 1;
                 }
             }
@@ -305,6 +317,7 @@ fn create_mailbox(
     mail_root: &Path,
     tgt: &TargetMailbox,
     local_by_jmap: &HashMap<String, MailboxRow>,
+    dry_run: bool,
 ) -> Result<()> {
     let parent_local_id = match &tgt.parent_jmap_id {
         None => None,
@@ -324,6 +337,14 @@ fn create_mailbox(
         jmap_state: None,
     };
     let dir = mail_root.join(&tgt.path);
+    if dry_run {
+        debug!(
+            "[dry-run] would create mailbox {:?} at {}",
+            tgt.name,
+            dir.display()
+        );
+        return Ok(());
+    }
     create_maildir(&dir)?;
     db.insert_mailbox(&row)?;
     debug!("created mailbox {:?} at {}", tgt.name, dir.display());
@@ -364,7 +385,23 @@ fn update_mailbox(
     mail_root: &Path,
     existing: &MailboxRow,
     new_row: &MailboxRow,
+    dry_run: bool,
 ) -> Result<()> {
+    if dry_run {
+        if existing.path != new_row.path {
+            debug!(
+                "[dry-run] would rename mailbox {} -> {}",
+                mail_root.join(&existing.path).display(),
+                mail_root.join(&new_row.path).display()
+            );
+        } else {
+            debug!(
+                "[dry-run] would update mailbox metadata for {}",
+                new_row.path
+            );
+        }
+        return Ok(());
+    }
     if existing.path != new_row.path {
         let old_dir = mail_root.join(&existing.path);
         let new_dir = mail_root.join(&new_row.path);
@@ -389,8 +426,21 @@ fn update_mailbox(
     Ok(())
 }
 
-fn delete_mailbox(db: &Database, mail_root: &Path, row: &MailboxRow) -> Result<()> {
+fn delete_mailbox(
+    db: &Database,
+    mail_root: &Path,
+    row: &MailboxRow,
+    dry_run: bool,
+) -> Result<()> {
     let dir = mail_root.join(&row.path);
+    if dry_run {
+        debug!(
+            "[dry-run] would delete mailbox {:?} at {}",
+            row.name,
+            dir.display()
+        );
+        return Ok(());
+    }
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("removing Maildir {}", dir.display()))?;
@@ -413,7 +463,11 @@ fn create_maildir(dir: &Path) -> Result<()> {
 // Orphaned-email cleanup
 // ---------------------------------------------------------------------------
 
-fn cleanup_orphaned_emails(db: &Database, mail_root: &Path) -> Result<usize> {
+fn cleanup_orphaned_emails(
+    db: &Database,
+    mail_root: &Path,
+    dry_run: bool,
+) -> Result<usize> {
     // An email whose email_mailboxes set is empty (because its last mailbox
     // membership was cascade-deleted) has no reason to exist on disk.
     let orphaned_ids: Vec<(String, String)> = {
@@ -436,6 +490,14 @@ fn cleanup_orphaned_emails(db: &Database, mail_root: &Path) -> Result<usize> {
         } else {
             mail_root.join(file_path)
         };
+        if dry_run {
+            debug!(
+                "[dry-run] would remove orphaned email {} (file {})",
+                id,
+                abs.display()
+            );
+            continue;
+        }
         if abs.exists() {
             if let Err(e) = std::fs::remove_file(&abs) {
                 debug!("could not remove orphaned {} ({e})", abs.display());
@@ -552,7 +614,7 @@ mod tests {
         db.insert_email(&email).unwrap();
         // deliberately no email_mailboxes row → email is orphaned.
 
-        let cleaned = cleanup_orphaned_emails(&db, tmp.path()).unwrap();
+        let cleaned = cleanup_orphaned_emails(&db, tmp.path(), false).unwrap();
         assert_eq!(cleaned, 1);
         assert!(!file_abs.exists());
         assert!(db.get_email(&email.id).unwrap().is_none());
@@ -594,7 +656,7 @@ mod tests {
         .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
-        let cleaned = cleanup_orphaned_emails(&db, tmp.path()).unwrap();
+        let cleaned = cleanup_orphaned_emails(&db, tmp.path(), false).unwrap();
         assert_eq!(cleaned, 0);
         assert!(db.get_email(&email.id).unwrap().is_some());
     }
@@ -668,7 +730,7 @@ mod tests {
         let dir = tmp.path().join(&mb.path);
         create_maildir(&dir).unwrap();
 
-        delete_mailbox(&db, tmp.path(), &mb).unwrap();
+        delete_mailbox(&db, tmp.path(), &mb, false).unwrap();
         assert!(!dir.exists());
         assert!(db.get_mailbox(&mb.id).unwrap().is_none());
     }
@@ -685,7 +747,7 @@ mod tests {
             sort_order: Some(0),
             path: "INBOX".to_string(),
         };
-        create_mailbox(&db, tmp.path(), &tgt, &HashMap::new()).unwrap();
+        create_mailbox(&db, tmp.path(), &tgt, &HashMap::new(), false).unwrap();
         assert!(tmp.path().join("INBOX/cur").is_dir());
         let stored = db.get_mailbox_by_jmap_id("j1").unwrap().unwrap();
         assert_eq!(stored.name, "INBOX");
@@ -718,7 +780,7 @@ mod tests {
             sort_order: Some(0),
             path: "Parent/Child".to_string(),
         };
-        create_mailbox(&db, tmp.path(), &child_tgt, &local_by_jmap).unwrap();
+        create_mailbox(&db, tmp.path(), &child_tgt, &local_by_jmap, false).unwrap();
         let stored = db.get_mailbox_by_jmap_id("jchild").unwrap().unwrap();
         assert_eq!(stored.parent_id, Some(parent.id));
     }
@@ -746,7 +808,7 @@ mod tests {
             name: "renamed".to_string(),
             ..existing.clone()
         };
-        update_mailbox(&db, tmp.path(), &existing, &new_row).unwrap();
+        update_mailbox(&db, tmp.path(), &existing, &new_row, false).unwrap();
         assert!(!tmp.path().join("old").exists());
         assert!(tmp.path().join("renamed/cur/test:2,").exists());
     }

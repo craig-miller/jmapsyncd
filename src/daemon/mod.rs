@@ -40,7 +40,7 @@ pub async fn run_account_sse_loop(
 
         // Sync-on-connect: catch anything that landed while we were
         // disconnected. First-boot sync also runs here.
-        if let Err(e) = sync::sync_account(&client, &acct, &db).await {
+        if let Err(e) = sync::sync_account(&client, &acct, &db, false).await {
             error!("[{acct_name}] initial sync failed: {e:#}");
         }
 
@@ -94,7 +94,7 @@ pub async fn run_account_sse_loop(
                 }
                 _ = maybe_tick(poll_interval.as_mut()) => {
                     debug!("[{acct_name}] poll timer fired; triggering sync");
-                    if let Err(e) = sync::sync_account(&client, &acct, &db).await {
+                    if let Err(e) = sync::sync_account(&client, &acct, &db, false).await {
                         error!("[{acct_name}] poll-triggered sync failed: {e:#}");
                     }
                 }
@@ -114,7 +114,7 @@ pub async fn run_account_sse_loop(
                                 last_event_id = Some(id.to_string());
                             }
                             debug!("[{acct_name}] SSE StateChange; triggering sync");
-                            if let Err(e) = sync::sync_account(&client, &acct, &db).await {
+                            if let Err(e) = sync::sync_account(&client, &acct, &db, false).await {
                                 error!("[{acct_name}] sync failed: {e:#}");
                             }
                         }
@@ -261,16 +261,21 @@ async fn run_daemon_inner(config: Config) -> anyhow::Result<()> {
 /// pass itself counts against the error tally — same policy as
 /// `run_daemon` for bring-up, stricter for the sync itself since a
 /// one-shot is meant to succeed or fail visibly.
-pub async fn run_sync_once(config: Config, account_filter: Option<&str>) -> anyhow::Result<()> {
+pub async fn run_sync_once(
+    config: Config,
+    account_filter: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     let local = LocalSet::new();
     local
-        .run_until(run_sync_once_inner(config, account_filter))
+        .run_until(run_sync_once_inner(config, account_filter, dry_run))
         .await
 }
 
 async fn run_sync_once_inner(
     config: Config,
     account_filter: Option<&str>,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     let mut matched = 0usize;
     let mut errors = 0usize;
@@ -325,7 +330,7 @@ async fn run_sync_once_inner(
             }
         };
 
-        match sync::sync_account(&client, &acct, &db).await {
+        match sync::sync_account(&client, &acct, &db, dry_run).await {
             Ok(_) => {}
             Err(e) => {
                 log::error!("[{}] sync failed: {e:#}", acct.name);

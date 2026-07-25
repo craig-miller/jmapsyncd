@@ -18,9 +18,10 @@ async fn main() -> std::process::ExitCode {
     match command {
         jmapsyncd::args::Command::Sync { account } => {
             if args.dry_run {
-                log::warn!("--dry-run not yet wired through the sync engine; running as normal sync");
+                log::info!("--dry-run: no filesystem or database writes will be performed");
             }
-            match jmapsyncd::daemon::run_sync_once(config, account.as_deref()).await {
+            match jmapsyncd::daemon::run_sync_once(config, account.as_deref(), args.dry_run).await
+            {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(e) => {
                     log::error!("sync exited with error: {e:#}");

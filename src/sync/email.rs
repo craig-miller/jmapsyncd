@@ -46,6 +46,7 @@ pub async fn sync_emails(
     db: &Database,
     mailboxes: &[MailboxRow],
     mail_root: &Path,
+    dry_run: bool,
 ) -> Result<EmailSyncStats> {
     if mailboxes.is_empty() {
         debug!("no mailboxes materialized; skipping email sync");
@@ -75,7 +76,7 @@ pub async fn sync_emails(
     // Deletes: any local row whose jmap_id is not in the server set.
     for (jmap_id, row) in &local_by_jmap {
         if !server_ids.contains(jmap_id) {
-            delete_email(db, mail_root, row)?;
+            delete_email(db, mail_root, row, dry_run)?;
             stats.deleted += 1;
         }
     }
@@ -95,14 +96,20 @@ pub async fn sync_emails(
                 &local_by_jmap,
                 &email,
                 &mut stats,
+                dry_run,
             )
             .await?;
         }
     }
 
     info!(
-        "email sync: {} new, {} updated, {} moved, {} deleted, {} bytes downloaded",
-        stats.created, stats.updated, stats.moved, stats.deleted, stats.bytes_downloaded,
+        "{}email sync: {} new, {} updated, {} moved, {} deleted, {} bytes downloaded",
+        if dry_run { "[dry-run] " } else { "" },
+        stats.created,
+        stats.updated,
+        stats.moved,
+        stats.deleted,
+        stats.bytes_downloaded,
     );
     Ok(stats)
 }
@@ -185,6 +192,7 @@ async fn fetch_email_chunk(client: &Client, ids: &[String]) -> Result<Vec<Email<
 // Three-state dispatch
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_email(
     client: &Client,
     db: &Database,
@@ -193,6 +201,7 @@ async fn apply_email(
     local_by_jmap: &HashMap<String, EmailRow>,
     email: &Email<Get>,
     stats: &mut EmailSyncStats,
+    dry_run: bool,
 ) -> Result<()> {
     let jmap_id = match email.id() {
         Some(id) => id.to_string(),
@@ -212,7 +221,7 @@ async fn apply_email(
                 debug!(
                     "email {jmap_id} has no in-scope mailbox; treating as delete"
                 );
-                delete_email(db, mail_root, existing)?;
+                delete_email(db, mail_root, existing, dry_run)?;
                 stats.deleted += 1;
             }
             return Ok(());
@@ -238,6 +247,7 @@ async fn apply_email(
                 &flags,
                 &keywords_json,
                 received_ts,
+                dry_run,
             )
             .await?;
             stats.created += 1;
@@ -261,6 +271,7 @@ async fn apply_email(
                     &flags,
                     &keywords_json,
                     received_ts,
+                    dry_run,
                 )?;
                 stats.moved += 1;
             } else if flags_changed || keywords_changed || memberships_changed {
@@ -273,6 +284,7 @@ async fn apply_email(
                     mailbox_by_jmap,
                     &flags,
                     &keywords_json,
+                    dry_run,
                 )?;
                 stats.updated += 1;
             }
@@ -299,10 +311,14 @@ async fn insert_email(
     flags: &str,
     keywords_json: &str,
     received_ts: i64,
+    dry_run: bool,
 ) -> Result<u64> {
     let blob_id = email
         .blob_id()
         .with_context(|| format!("email {jmap_id} has no blobId"))?;
+    // Blob/download still runs under dry-run so stats.bytes_downloaded
+    // reflects the real transfer size we'd have paid for. Only the disk
+    // write is skipped inside download_and_write.
     let (rel_path, bytes) = download_and_write(
         client,
         blob_id,
@@ -310,8 +326,20 @@ async fn insert_email(
         &primary_mailbox.path,
         received_ts,
         flags,
+        dry_run,
     )
     .await?;
+
+    if dry_run {
+        debug!(
+            "[dry-run] would create email {} at {} ({} bytes, subject: {:?})",
+            jmap_id,
+            rel_path,
+            bytes,
+            email.subject()
+        );
+        return Ok(bytes);
+    }
 
     let row = EmailRow {
         id: generate_id(),
@@ -348,10 +376,20 @@ fn update_email_in_place(
     mailbox_by_jmap: &HashMap<String, &MailboxRow>,
     flags: &str,
     keywords_json: &str,
+    dry_run: bool,
 ) -> Result<()> {
     // Rename file in place if flags changed. Filename base stays; suffix
     // updates to the new :2,{flags} string.
     let new_rel = rebuild_path_with_flags(&existing.file_path, flags);
+    if dry_run {
+        debug!(
+            "[dry-run] would update email {} in place ({} -> {})",
+            existing.jmap_id.as_deref().unwrap_or("<no jmap_id>"),
+            existing.file_path,
+            new_rel
+        );
+        return Ok(());
+    }
     if new_rel != existing.file_path {
         let old_abs = mail_root.join(&existing.file_path);
         let new_abs = mail_root.join(&new_rel);
@@ -397,6 +435,7 @@ fn move_email(
     flags: &str,
     keywords_json: &str,
     received_ts: i64,
+    dry_run: bool,
 ) -> Result<()> {
     // Reuse the existing file's UUID part to preserve dedup identity if the
     // caller ever grew hardlink logic; the ts:{flags} portions can change.
@@ -406,6 +445,15 @@ fn move_email(
         "{}/cur/{new_basename}:2,{flags}",
         new_primary.path
     );
+    if dry_run {
+        debug!(
+            "[dry-run] would move email {} ({} -> {})",
+            existing.jmap_id.as_deref().unwrap_or("<no jmap_id>"),
+            existing.file_path,
+            new_rel
+        );
+        return Ok(());
+    }
     let new_abs = mail_root.join(&new_rel);
     if let Some(parent) = new_abs.parent() {
         std::fs::create_dir_all(parent)
@@ -439,8 +487,21 @@ fn move_email(
 // DELETE
 // ---------------------------------------------------------------------------
 
-fn delete_email(db: &Database, mail_root: &Path, row: &EmailRow) -> Result<()> {
+fn delete_email(
+    db: &Database,
+    mail_root: &Path,
+    row: &EmailRow,
+    dry_run: bool,
+) -> Result<()> {
     let abs = mail_root.join(&row.file_path);
+    if dry_run {
+        debug!(
+            "[dry-run] would delete email {} at {}",
+            row.jmap_id.as_deref().unwrap_or("<no jmap_id>"),
+            abs.display()
+        );
+        return Ok(());
+    }
     if abs.exists() {
         if let Err(e) = std::fs::remove_file(&abs) {
             warn!("could not remove {} ({e})", abs.display());
@@ -600,6 +661,7 @@ async fn download_and_write(
     primary_path: &str,
     ts: i64,
     flags: &str,
+    dry_run: bool,
 ) -> Result<(String, u64)> {
     let bytes = client
         .download(blob_id)
@@ -610,8 +672,14 @@ async fn download_and_write(
     let uuid = new_uuid_string();
     let basename = format!("{ts}.{uuid}");
     let mailbox_dir = mail_root.join(primary_path);
-    let tmp_abs = mailbox_dir.join("tmp").join(&basename);
     let final_rel = format!("{primary_path}/cur/{basename}:2,{flags}");
+
+    if dry_run {
+        // Blob downloaded (for realistic bytes stat) but no mkdir/write/rename.
+        return Ok((final_rel, size));
+    }
+
+    let tmp_abs = mailbox_dir.join("tmp").join(&basename);
     let final_abs = mail_root.join(&final_rel);
 
     std::fs::create_dir_all(mailbox_dir.join("tmp"))

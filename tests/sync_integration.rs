@@ -331,7 +331,7 @@ async fn fresh_initial_sync_end_to_end() {
     let client = jmap::client_from_account(&account)
         .await
         .expect("client_from_account should succeed against mock");
-    let stats = sync::sync_account(&client, &account, &db)
+    let stats = sync::sync_account(&client, &account, &db, false)
         .await
         .expect("sync_account should succeed against mock");
 
