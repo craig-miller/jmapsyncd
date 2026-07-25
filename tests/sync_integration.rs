@@ -1,11 +1,16 @@
-//! End-to-end integration test exercising sync_account against a wiremock
-//! JMAP server serving realistic (RFC 8620 / 8621) wire responses.
+//! Integration tests exercising sync_account against a wiremock JMAP server
+//! serving realistic (RFC 8620 / 8621) wire responses.
 //!
-//! Scope: one comprehensive test covering the full pipeline
-//! (Mailbox/get -> Email/query per-mailbox -> Email/get -> Blob/download ->
-//! Maildir write -> DB rows). Adding scenario-specific tests (deletion,
-//! keyword change, rename) is straightforward on top of this scaffold once
-//! the base is proven.
+//! Coverage:
+//! - fresh_initial_sync_end_to_end: full initial sync pipeline
+//!   (Mailbox/get -> Email/query per-mailbox -> Email/get -> Blob/download
+//!   -> Maildir write -> DB rows).
+//! - second_sync_with_no_changes_is_noop: idempotency guard — re-running
+//!   sync against unchanged server state must not re-create or update.
+//! - email_deleted_on_server_removed_locally: reverse-direction sync —
+//!   removing an email from the server drops it from DB + Maildir.
+//! - dry_run_leaves_db_and_maildir_untouched: C.4b invariant — dry_run=true
+//!   short-circuits every write; DB rows stay at 0, no dirs created.
 
 use jmapsyncd::config::{Account, MailConfig, SyncMode, TokenSource};
 use jmapsyncd::db::Database;
@@ -232,6 +237,43 @@ fn email_get_body() -> Value {
     )
 }
 
+// Same as email_get_body but without e-sent — used to simulate a server-side
+// deletion of that email.
+fn email_get_body_without_esent() -> Value {
+    respond(
+        "Email/get",
+        json!({
+            "accountId": ACCOUNT_ID,
+            "state": "estate2",
+            "list": [
+                {
+                    "id": "e-inbox",
+                    "blobId": "b-inbox",
+                    "threadId": "t1",
+                    "mailboxIds": {"mb-inbox": true},
+                    "keywords": {"$seen": true},
+                    "size": 512,
+                    "receivedAt": "2026-01-15T10:30:00Z",
+                    "messageId": ["<inbox-msg@example.com>"],
+                    "subject": "Hello from INBOX"
+                },
+                {
+                    "id": "e-cross",
+                    "blobId": "b-cross",
+                    "threadId": "t2",
+                    "mailboxIds": {"mb-inbox": true, "mb-archive": true},
+                    "keywords": {"$seen": true, "$flagged": true},
+                    "size": 1024,
+                    "receivedAt": "2026-01-16T11:00:00Z",
+                    "messageId": ["<cross-msg@example.com>"],
+                    "subject": "Cross-filed"
+                }
+            ],
+            "notFound": []
+        }),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Config + client wiring
 // ---------------------------------------------------------------------------
@@ -258,31 +300,26 @@ fn build_account(jmap_host: &str, mail_path: PathBuf) -> Account {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The test
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fresh_initial_sync_end_to_end() {
-    let server = MockServer::start().await;
-    let base_url = server.uri();
-
-    // 1. Session (jmap-client fetches this via .connect())
+// Mount the canonical mock-server responses: session + Mailbox/get (3 mbs)
+// + Email/query per mailbox + Email/get (3 emails) + Blob/download per blob.
+// Every test that wants the "default sunny state" calls this.
+async fn setup_default_mocks(server: &MockServer, base_url: &str) {
+    // 1. Session
     Mock::given(method("GET"))
         .and(path("/.well-known/jmap"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(session_response(&base_url)))
-        .mount(&server)
+        .respond_with(ResponseTemplate::new(200).set_body_json(session_response(base_url)))
+        .mount(server)
         .await;
 
-    // 2. Mailbox/get — full tree (B.2's first call)
+    // 2. Mailbox/get — full tree
     Mock::given(method("POST"))
         .and(path("/jmap/api/"))
         .and(JmapMethodIs("Mailbox/get"))
         .respond_with(ResponseTemplate::new(200).set_body_json(mailbox_get_body()))
-        .mount(&server)
+        .mount(server)
         .await;
 
-    // 3. Email/query — one mock per mailbox (differentiated by filter.inMailbox)
+    // 3. Email/query — one mock per mailbox
     for (mb_id, email_ids) in [
         ("mb-inbox", &["e-inbox", "e-cross"][..]),
         ("mb-sent", &["e-sent"][..]),
@@ -294,20 +331,19 @@ async fn fresh_initial_sync_end_to_end() {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(email_query_body(mb_id, email_ids)),
             )
-            .mount(&server)
+            .mount(server)
             .await;
     }
 
-    // 4. Email/get — chunked; only one chunk here since we have < 100 emails
+    // 4. Email/get — single chunk (all 3 emails fit)
     Mock::given(method("POST"))
         .and(path("/jmap/api/"))
         .and(JmapMethodIs("Email/get"))
         .respond_with(ResponseTemplate::new(200).set_body_json(email_get_body()))
-        .mount(&server)
+        .mount(server)
         .await;
 
-    // 5. Blob/download — one per unique blobId (e-cross downloaded once,
-    // filed under its primary mailbox only).
+    // 5. Blob/download — one per unique blobId
     for (blob_id, body) in [
         ("b-inbox", "From: a@x\r\nSubject: Hello from INBOX\r\n\r\nbody-inbox"),
         ("b-cross", "From: b@x\r\nSubject: Cross-filed\r\n\r\nbody-cross"),
@@ -318,11 +354,76 @@ async fn fresh_initial_sync_end_to_end() {
                 "/jmap/download/{ACCOUNT_ID}/{blob_id}/none"
             )))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_bytes()))
-            .mount(&server)
+            .mount(server)
+            .await;
+    }
+}
+
+// Like setup_default_mocks, but e-sent is gone from the server: the Sent
+// mailbox returns an empty Email/query, and Email/get omits e-sent from
+// its list. Used by the deletion-propagation test after server.reset().
+async fn setup_mocks_without_esent(server: &MockServer, base_url: &str) {
+    Mock::given(method("GET"))
+        .and(path("/.well-known/jmap"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(session_response(base_url)))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/jmap/api/"))
+        .and(JmapMethodIs("Mailbox/get"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mailbox_get_body()))
+        .mount(server)
+        .await;
+
+    // mb-sent's Email/query now returns []; the others unchanged.
+    for (mb_id, email_ids) in [
+        ("mb-inbox", &["e-inbox", "e-cross"][..]),
+        ("mb-sent", &[][..]),
+        ("mb-archive", &["e-cross"][..]),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/jmap/api/"))
+            .and(EmailQueryFor(mb_id))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(email_query_body(mb_id, email_ids)),
+            )
+            .mount(server)
             .await;
     }
 
-    // Run sync
+    Mock::given(method("POST"))
+        .and(path("/jmap/api/"))
+        .and(JmapMethodIs("Email/get"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(email_get_body_without_esent()))
+        .mount(server)
+        .await;
+
+    // Blobs for the surviving emails only; b-sent no longer needed.
+    for (blob_id, body) in [
+        ("b-inbox", "From: a@x\r\nSubject: Hello from INBOX\r\n\r\nbody-inbox"),
+        ("b-cross", "From: b@x\r\nSubject: Cross-filed\r\n\r\nbody-cross"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/jmap/download/{ACCOUNT_ID}/{blob_id}/none"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_bytes()))
+            .mount(server)
+            .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_initial_sync_end_to_end() {
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    setup_default_mocks(&server, &base_url).await;
+
     let tmp = tempfile::tempdir().unwrap();
     let mail_root = tmp.path().to_path_buf();
     let account = build_account(&base_url, mail_root.clone());
@@ -334,8 +435,6 @@ async fn fresh_initial_sync_end_to_end() {
     let stats = sync::sync_account(&client, &account, &db, false)
         .await
         .expect("sync_account should succeed against mock");
-
-    // --------------------- Assertions -----------------------
 
     // DB has 3 mailboxes
     let mbs = db.get_all_mailboxes().unwrap();
@@ -437,6 +536,129 @@ async fn fresh_initial_sync_end_to_end() {
             entries.is_empty(),
             "tmp/ should be empty after successful writes, {mb_name}/tmp has {} entries",
             entries.len()
+        );
+    }
+}
+
+/// Second sync against unchanged server state must be a total no-op: no
+/// creates, updates, moves, deletes. Guards against phantom drift bugs
+/// where equality checks compare wrong fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_sync_with_no_changes_is_noop() {
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    setup_default_mocks(&server, &base_url).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let account = build_account(&base_url, tmp.path().to_path_buf());
+    let db = Database::open_in_memory().unwrap();
+    let client = jmap::client_from_account(&account).await.unwrap();
+
+    // First sync: brings up the world.
+    let stats1 = sync::sync_account(&client, &account, &db, false).await.unwrap();
+    assert_eq!(stats1.email.created, 3);
+
+    // Second sync against the same mock responses.
+    let stats2 = sync::sync_account(&client, &account, &db, false).await.unwrap();
+    assert_eq!(stats2.email.created, 0, "second sync must not re-create");
+    assert_eq!(stats2.email.updated, 0, "second sync must not re-update");
+    assert_eq!(stats2.email.moved, 0, "second sync must not re-move");
+    assert_eq!(stats2.email.deleted, 0, "second sync must not delete");
+
+    // DB counts unchanged.
+    assert_eq!(db.get_all_mailboxes().unwrap().len(), 3);
+    assert_eq!(db.get_all_emails().unwrap().len(), 3);
+}
+
+/// An email that disappears from the server (dropped from all Email/query
+/// results and from Email/get) must be removed from local DB + Maildir.
+/// Verifies the reverse-direction delete path in sync_emails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn email_deleted_on_server_removed_locally() {
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    setup_default_mocks(&server, &base_url).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mail_root = tmp.path().to_path_buf();
+    let account = build_account(&base_url, mail_root.clone());
+    let db = Database::open_in_memory().unwrap();
+    let client = jmap::client_from_account(&account).await.unwrap();
+
+    // Round 1: full state.
+    sync::sync_account(&client, &account, &db, false).await.unwrap();
+    assert_eq!(db.get_all_emails().unwrap().len(), 3);
+
+    // Capture e-sent's file path so we can prove it goes away.
+    let e_sent = db
+        .get_all_emails()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.jmap_id.as_deref() == Some("e-sent"))
+        .expect("e-sent should exist after round 1");
+    let sent_file = mail_root.join(&e_sent.file_path);
+    assert!(sent_file.exists(), "e-sent Maildir file should exist before round 2");
+
+    // Round 2: server no longer knows about e-sent.
+    server.reset().await;
+    setup_mocks_without_esent(&server, &base_url).await;
+
+    let stats2 = sync::sync_account(&client, &account, &db, false).await.unwrap();
+    assert_eq!(stats2.email.deleted, 1, "e-sent should be counted as deleted");
+    assert_eq!(stats2.email.created, 0);
+
+    // DB row gone.
+    let surviving_ids: Vec<String> = db
+        .get_all_emails()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| e.jmap_id)
+        .collect();
+    assert_eq!(surviving_ids.len(), 2);
+    assert!(!surviving_ids.contains(&"e-sent".to_string()));
+    assert!(surviving_ids.contains(&"e-inbox".to_string()));
+    assert!(surviving_ids.contains(&"e-cross".to_string()));
+
+    // Maildir file gone from disk.
+    assert!(!sent_file.exists(), "e-sent Maildir file should be gone");
+}
+
+/// C.4b invariant: sync_account with dry_run=true must never touch the DB
+/// or the Maildir tree. Read-side JMAP calls still fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dry_run_leaves_db_and_maildir_untouched() {
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    setup_default_mocks(&server, &base_url).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mail_root = tmp.path().to_path_buf();
+    let account = build_account(&base_url, mail_root.clone());
+    let db = Database::open_in_memory().unwrap();
+    let client = jmap::client_from_account(&account).await.unwrap();
+
+    // Sync must succeed (read side works) but write nothing.
+    sync::sync_account(&client, &account, &db, true)
+        .await
+        .expect("dry-run sync should succeed against mock");
+
+    // DB untouched.
+    assert_eq!(
+        db.get_all_mailboxes().unwrap().len(),
+        0,
+        "no mailbox rows should be written under dry-run"
+    );
+    assert_eq!(
+        db.get_all_emails().unwrap().len(),
+        0,
+        "no email rows should be written under dry-run"
+    );
+
+    // No Maildir dirs created.
+    for mb_name in ["Inbox", "Sent", "Archive"] {
+        assert!(
+            !mail_root.join(mb_name).exists(),
+            "{mb_name}/ must not exist under dry-run"
         );
     }
 }
