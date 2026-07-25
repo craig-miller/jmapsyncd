@@ -7,7 +7,11 @@ use jmap_client::client::Client;
 use jmap_client::event_source::PushNotification;
 use log::{debug, error, info, warn};
 use std::time::Duration;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::task::{LocalSet, spawn_local};
 use tokio_util::sync::CancellationToken;
+
+use crate::config::Config;
 
 const SSE_CONNECT_BACKOFF: Duration = Duration::from_secs(5);
 const SSE_STREAM_DROP_BACKOFF: Duration = Duration::from_secs(1);
@@ -145,4 +149,104 @@ async fn sleep_or_cancel(d: Duration, cancel: &CancellationToken) {
         _ = tokio::time::sleep(d) => {}
         _ = cancel.cancelled() => {}
     }
+}
+
+/// Long-running daemon: spawns one supervised task per enabled account,
+/// waits for SIGTERM or SIGINT, then fires the shared CancellationToken
+/// so every task exits cleanly.
+///
+/// Bad client-build for one account is logged and skipped, not fatal —
+/// a single misconfigured account shouldn't take the daemon down.
+pub async fn run_daemon(config: Config) -> anyhow::Result<()> {
+    // Database (rusqlite Connection) is !Sync, so the sync_account futures
+    // aren't Send. Run all account tasks on a LocalSet — single-threaded
+    // per-thread, non-Send futures OK. In practice each account is fully
+    // I/O bound (JMAP over reqwest yields on every network op), so
+    // single-threading is fine for the account counts we expect (1-3).
+    let local = LocalSet::new();
+    local.run_until(run_daemon_inner(config)).await
+}
+
+async fn run_daemon_inner(config: Config) -> anyhow::Result<()> {
+    let cancel = CancellationToken::new();
+
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut spawned = 0usize;
+
+    for acct in config.accounts.into_iter().filter(|a| a.enabled) {
+        if acct.mail.is_none() {
+            log::warn!(
+                "[{}] no [accounts.mail] section; skipping (nothing to sync to)",
+                acct.name
+            );
+            continue;
+        }
+
+        let db_path = config.db_dir.join(format!("{}.sqlite", acct.name));
+        if let Some(parent) = db_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::error!(
+                    "[{}] cannot create db_dir {}: {e}; skipping account",
+                    acct.name,
+                    parent.display()
+                );
+                continue;
+            }
+        }
+        let db = match crate::db::Database::open(&db_path) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!(
+                    "[{}] failed to open database at {}: {e:#}; skipping account",
+                    acct.name,
+                    db_path.display()
+                );
+                continue;
+            }
+        };
+
+        let client = match crate::jmap::client_from_account(&acct).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!(
+                    "[{}] failed to authenticate JMAP client: {e:#}; skipping account",
+                    acct.name
+                );
+                continue;
+            }
+        };
+
+        let task_cancel = cancel.child_token();
+        let acct_name = acct.name.clone();
+        let handle = spawn_local(async move {
+            run_account_sse_loop(client, acct, db, task_cancel).await;
+            log::info!("[{acct_name}] task exited");
+        });
+        handles.push(handle);
+        spawned += 1;
+    }
+
+    if spawned == 0 {
+        anyhow::bail!("no accounts to run; enable at least one account in config");
+    }
+
+    log::info!("daemon running with {spawned} account task(s); waiting for SIGTERM/SIGINT");
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = sigterm.recv() => log::info!("received SIGTERM"),
+        _ = sigint.recv()  => log::info!("received SIGINT"),
+    }
+
+    log::info!("shutting down; cancelling account tasks");
+    cancel.cancel();
+
+    for h in handles {
+        if let Err(e) = h.await {
+            log::error!("account task join error: {e}");
+        }
+    }
+    log::info!("all account tasks exited; daemon done");
+    Ok(())
 }
