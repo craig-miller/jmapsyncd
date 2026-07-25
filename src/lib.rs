@@ -7,3 +7,4 @@ pub mod db;
 pub mod jmap;
 
 pub mod sync;
+pub mod daemon;
