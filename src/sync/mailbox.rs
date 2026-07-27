@@ -69,6 +69,7 @@ pub async fn sync_mailboxes(
 
 async fn fetch_full_tree(client: &Client) -> Result<Vec<Mailbox<Get>>> {
     let mut request = client.build();
+    crate::jmap::restrict_using(&mut request);
     request.get_mailbox();
     let mut resp: MailboxGetResponse = request
         .send_single()

@@ -141,6 +141,7 @@ async fn page_query_ids(client: &Client, mailbox_jmap_id: &str) -> Result<Vec<St
     let mut position: i32 = 0;
     loop {
         let mut request = client.build();
+        crate::jmap::restrict_using(&mut request);
         request
             .query_email()
             .filter(email::query::Filter::in_mailbox(mailbox_jmap_id.to_string()))
@@ -164,6 +165,7 @@ async fn page_query_ids(client: &Client, mailbox_jmap_id: &str) -> Result<Vec<St
 
 async fn fetch_email_chunk(client: &Client, ids: &[String]) -> Result<Vec<Email<Get>>> {
     let mut request = client.build();
+    crate::jmap::restrict_using(&mut request);
     request.get_email().ids(ids.iter().cloned()).properties([
         Property::Id,
         Property::BlobId,

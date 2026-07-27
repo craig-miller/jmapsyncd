@@ -1,7 +1,24 @@
 use crate::config::{Account, TokenSource};
 use anyhow::{Context, Result, bail};
+use jmap_client::URI;
 use jmap_client::client::{Client, Credentials};
+use jmap_client::core::request::Request;
 use std::time::Duration;
+
+/// Restrict a request's `using` capability list to just what jmapsyncd
+/// actually needs (Core + Mail). jmap-client 0.4 declares the full URI
+/// enum by default — including :sieve and :websocket, which Fastmail
+/// rejects with a 400 (`error:unknownCapability`) because they aren't
+/// on that account's advertised capability set.
+///
+/// TODO: derive this from the session's advertised capabilities so any
+/// JMAP provider works without having to know its supported URIs
+/// ahead of time.
+pub fn restrict_using(request: &mut Request<'_>) {
+    request.using.clear();
+    request.using.push(URI::Core);
+    request.using.push(URI::Mail);
+}
 
 pub async fn client_from_account(acct: &Account) -> Result<Client> {
     let token = resolve_token(&acct.token)
@@ -15,12 +32,36 @@ pub async fn client_from_account(acct: &Account) -> Result<Client> {
         format!("https://{}", acct.jmap_host)
     };
 
+    // jmap-client's default redirect policy rejects any target host not in
+    // its trusted_hosts set — so Fastmail's same-origin
+    // /.well-known/jmap -> /jmap/session redirect gets blocked ("Aborting
+    // redirect request to unknown host"). Pass the JMAP host explicitly
+    // so same-origin redirects follow while cross-origin ones still error.
+    let trusted_host = extract_host(&url)
+        .with_context(|| format!("parsing JMAP host from {url}"))?;
+
     Client::new()
         .credentials(Credentials::Bearer(token))
+        .follow_redirects([trusted_host])
         .timeout(Duration::from_secs(acct.timeout_secs))
         .connect(&url)
         .await
         .with_context(|| format!("connecting to JMAP endpoint {url}"))
+}
+
+/// Pull the host portion out of a URL string, ignoring scheme, port, and
+/// path. Small, dependency-free parser — url::Url would be a whole crate
+/// dep for one call site.
+fn extract_host(url: &str) -> Result<String> {
+    let after_scheme = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    let host = after_scheme.split(['/', ':']).next().unwrap_or("");
+    if host.is_empty() {
+        bail!("could not extract host from {url:?}");
+    }
+    Ok(host.to_string())
 }
 
 fn resolve_token(source: &TokenSource) -> Result<String> {
@@ -133,5 +174,22 @@ mod tests {
         let err = resolve_token(&cmd_src("echo boom >&2; exit 1")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("boom"));
+    }
+
+    #[test]
+    fn extract_host_strips_scheme_port_and_path() {
+        assert_eq!(extract_host("api.fastmail.com").unwrap(), "api.fastmail.com");
+        assert_eq!(extract_host("https://api.fastmail.com").unwrap(), "api.fastmail.com");
+        assert_eq!(
+            extract_host("https://api.fastmail.com/jmap/session").unwrap(),
+            "api.fastmail.com"
+        );
+        assert_eq!(extract_host("http://127.0.0.1:8080/path").unwrap(), "127.0.0.1");
+    }
+
+    #[test]
+    fn extract_host_empty_errors() {
+        assert!(extract_host("").is_err());
+        assert!(extract_host("https://").is_err());
     }
 }
