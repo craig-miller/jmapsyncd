@@ -528,6 +528,7 @@ mod tests {
             box_filter: None,
             tls: None,
             box_mapping: Vec::new(),
+            post_sync_hook: None,
         }
     }
 

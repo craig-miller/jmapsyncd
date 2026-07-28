@@ -117,6 +117,8 @@ pub struct MailConfig {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub box_mapping: Vec<BoxMapping>,
+    #[serde(default)]
+    pub post_sync_hook: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

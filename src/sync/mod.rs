@@ -5,7 +5,7 @@ use crate::config::Account;
 use crate::db::Database;
 use anyhow::{Context, Result};
 use jmap_client::client::Client;
-use log::info;
+use log::{debug, info, warn};
 use std::time::Instant;
 
 use self::email::EmailSyncStats;
@@ -56,5 +56,29 @@ pub async fn sync_account(
         email.deleted,
         email.bytes_downloaded,
     );
+
+    if !dry_run && email.created + email.updated + email.moved + email.deleted > 0 {
+        if let Some(hook) = mail_cfg.post_sync_hook.clone() {
+            let account_name = acct.name.clone();
+            tokio::spawn(async move {
+                match tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&hook)
+                    .status()
+                    .await
+                {
+                    Ok(s) if s.success() => {
+                        debug!("[{}] post-sync hook OK: {}", account_name, hook)
+                    }
+                    Ok(s) => warn!("[{}] post-sync hook exit {}: {}", account_name, s, hook),
+                    Err(e) => warn!(
+                        "[{}] post-sync hook spawn failed: {}: {}",
+                        account_name, e, hook
+                    ),
+                }
+            });
+        }
+    }
+
     Ok(SyncStats { email, elapsed_ms })
 }
