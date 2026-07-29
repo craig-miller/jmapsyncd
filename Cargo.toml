@@ -28,3 +28,10 @@ serde_rusqlite = "0.35"
 tempfile = "3"
 wiremock = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Consume the craig-miller/jmap-client zentoo branch until upstream merges
+# the empty-State-event skip fix — Fastmail's opening ":new event source
+# connection\r\n\r\n" keep-alive triggers a serde_json EOF error in 0.4.2
+# and forces reconnect every ~5s. See craig-miller/jmap-client@bf59494.
+[patch.crates-io]
+jmap-client = { git = "https://github.com/craig-miller/jmap-client.git", branch = "zentoo" }

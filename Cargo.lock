@@ -1114,8 +1114,7 @@ dependencies = [
 [[package]]
 name = "jmap-client"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4deab22e057d24e32122f0fc6e2d667a124fdd6a0d8ef3ed4f8a89923c11084f"
+source = "git+https://github.com/craig-miller/jmap-client.git?branch=zentoo#bf59494382796df2aa8ce5e76e077c15627f7ceb"
 dependencies = [
  "ahash",
  "async-stream",
