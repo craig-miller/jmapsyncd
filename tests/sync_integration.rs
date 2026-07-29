@@ -668,3 +668,274 @@ async fn dry_run_leaves_db_and_maildir_untouched() {
 fn ensure_dir(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Write-back mock body: Email/set acknowledgement.
+// ---------------------------------------------------------------------------
+
+fn email_set_body(destroyed: &[&str], updated: &[&str]) -> Value {
+    let updated_map: serde_json::Map<String, Value> = updated
+        .iter()
+        .map(|id| ((*id).to_string(), Value::Null))
+        .collect();
+    respond(
+        "Email/set",
+        json!({
+            "accountId": ACCOUNT_ID,
+            "oldState": "estate1",
+            "newState": "estate2",
+            "destroyed": destroyed,
+            "updated": updated_map,
+        }),
+    )
+}
+
+async fn last_email_set_body(server: &MockServer) -> Value {
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server should be running");
+    requests
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .find(|v| v["methodCalls"][0][0].as_str() == Some("Email/set"))
+        .expect("no Email/set call recorded on the mock server")
+}
+
+/// Simulates aerc :delete: the user hits :delete in aerc, notmuch's
+/// `db.RemoveMessage` unlinks the maildir file. On the next jmapsyncd
+/// tick, the write-back pre-pass sees the missing file, issues Email/set
+/// destroy against the server, and the existing delete pass then cleans
+/// the SQLite row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroy_propagates_when_local_file_unlinked() {
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    setup_default_mocks(&server, &base_url).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mail_root = tmp.path().to_path_buf();
+    let account = build_account(&base_url, mail_root.clone());
+    let db = Database::open_in_memory().unwrap();
+    let client = jmap::client_from_account(&account).await.unwrap();
+
+    // Round 1: bring up state (3 emails).
+    sync::sync_account(&client, &account, &db, false)
+        .await
+        .unwrap();
+    let e_sent = db
+        .get_all_emails()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.jmap_id.as_deref() == Some("e-sent"))
+        .expect("e-sent should exist after round 1");
+    let sent_file = mail_root.join(&e_sent.file_path);
+    assert!(sent_file.exists(), "e-sent Maildir file exists before delete");
+
+    // Simulate aerc :delete on notmuch backend: unlink the file.
+    std::fs::remove_file(&sent_file).unwrap();
+
+    // Round 2: server still knows about e-sent; the write-back pre-pass
+    // must push Email/set destroy for it.
+    server.reset().await;
+    setup_default_mocks(&server, &base_url).await;
+    Mock::given(method("POST"))
+        .and(path("/jmap/api/"))
+        .and(JmapMethodIs("Email/set"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(email_set_body(&["e-sent"], &[])),
+        )
+        .mount(&server)
+        .await;
+
+    let stats = sync::sync_account(&client, &account, &db, false)
+        .await
+        .unwrap();
+
+    // Write-back owns the whole local cleanup for successful destroys —
+    // stats.deleted (server-initiated) stays 0, destroyed_upstream reflects
+    // the JMAP write we made.
+    assert_eq!(stats.email.destroyed_upstream, 1, "one destroy pushed upstream");
+    assert_eq!(stats.email.deleted, 0, "delete pass does not double-fire");
+    assert_eq!(stats.email.created, 0);
+    assert_eq!(stats.email.updated, 0);
+    assert_eq!(stats.email.updated_upstream, 0);
+
+    // SQLite row gone.
+    let surviving: Vec<String> = db
+        .get_all_emails()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| e.jmap_id)
+        .collect();
+    assert!(!surviving.contains(&"e-sent".to_string()));
+    assert_eq!(surviving.len(), 2);
+
+    // Verify the wire actually saw Email/set with destroy=[e-sent].
+    let body = last_email_set_body(&server).await;
+    let destroy_arr = body["methodCalls"][0][1]["destroy"]
+        .as_array()
+        .expect("destroy list on Email/set body");
+    assert!(
+        destroy_arr.iter().any(|v| v.as_str() == Some("e-sent")),
+        "Email/set destroy must include e-sent, got {body}"
+    );
+}
+
+/// Simulates notmuch flag sync after aerc :mark-read: the maildir file's
+/// suffix gains `S`. On the next jmapsyncd tick, the write-back pre-pass
+/// notices the drift and pushes `keywords/$seen: true` upstream via
+/// Email/set update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyword_update_propagates_when_local_flag_added() {
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    setup_default_mocks(&server, &base_url).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mail_root = tmp.path().to_path_buf();
+    let account = build_account(&base_url, mail_root.clone());
+    let db = Database::open_in_memory().unwrap();
+    let client = jmap::client_from_account(&account).await.unwrap();
+
+    sync::sync_account(&client, &account, &db, false)
+        .await
+        .unwrap();
+    let e_sent = db
+        .get_all_emails()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.jmap_id.as_deref() == Some("e-sent"))
+        .expect("e-sent exists");
+    // e-sent starts with no keywords → :2, suffix.
+    assert!(
+        e_sent.file_path.ends_with(":2,"),
+        "e-sent should start unread: {}",
+        e_sent.file_path
+    );
+    let sent_abs = mail_root.join(&e_sent.file_path);
+    assert!(sent_abs.exists());
+
+    // Simulate notmuch's synchronize_flags rename after aerc :mark-read
+    // adds tag +seen: file renamed from :2, to :2,S.
+    let new_abs = sent_abs.with_file_name(format!(
+        "{}S",
+        sent_abs.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::rename(&sent_abs, &new_abs).unwrap();
+
+    // Second-tick mocks reflect the post-writeback server state:
+    // Email/query still returns all 3, Email/set accepts our update, and
+    // Email/get now reports e-sent with $seen: true (what we just pushed).
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/jmap"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(session_response(&base_url)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/jmap/api/"))
+        .and(JmapMethodIs("Mailbox/get"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mailbox_get_body()))
+        .mount(&server)
+        .await;
+    for (mb_id, ids) in [
+        ("mb-inbox", &["e-inbox", "e-cross"][..]),
+        ("mb-sent", &["e-sent"][..]),
+        ("mb-archive", &["e-cross"][..]),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/jmap/api/"))
+            .and(EmailQueryFor(mb_id))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(email_query_body(mb_id, ids)),
+            )
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/jmap/api/"))
+        .and(JmapMethodIs("Email/set"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(email_set_body(&[], &["e-sent"])),
+        )
+        .mount(&server)
+        .await;
+    // Post-writeback Email/get: e-sent now carries $seen: true on the
+    // server, matching what our write-back just pushed.
+    Mock::given(method("POST"))
+        .and(path("/jmap/api/"))
+        .and(JmapMethodIs("Email/get"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond(
+            "Email/get",
+            json!({
+                "accountId": ACCOUNT_ID,
+                "state": "estate2",
+                "list": [
+                    {
+                        "id": "e-inbox", "blobId": "b-inbox", "threadId": "t1",
+                        "mailboxIds": {"mb-inbox": true},
+                        "keywords": {"$seen": true},
+                        "size": 512, "receivedAt": "2026-01-15T10:30:00Z",
+                        "messageId": ["<inbox-msg@example.com>"],
+                        "subject": "Hello from INBOX"
+                    },
+                    {
+                        "id": "e-cross", "blobId": "b-cross", "threadId": "t2",
+                        "mailboxIds": {"mb-inbox": true, "mb-archive": true},
+                        "keywords": {"$seen": true, "$flagged": true},
+                        "size": 1024, "receivedAt": "2026-01-16T11:00:00Z",
+                        "messageId": ["<cross-msg@example.com>"],
+                        "subject": "Cross-filed"
+                    },
+                    {
+                        "id": "e-sent", "blobId": "b-sent", "threadId": "t3",
+                        "mailboxIds": {"mb-sent": true},
+                        "keywords": {"$seen": true},
+                        "size": 256, "receivedAt": "2026-01-17T09:00:00Z",
+                        "messageId": ["<sent-msg@example.com>"],
+                        "subject": "Sent item"
+                    }
+                ],
+                "notFound": []
+            }),
+        )))
+        .mount(&server)
+        .await;
+
+    let stats = sync::sync_account(&client, &account, &db, false)
+        .await
+        .unwrap();
+
+    assert_eq!(stats.email.updated_upstream, 1, "one keyword-update pushed");
+    assert_eq!(stats.email.destroyed_upstream, 0);
+    assert_eq!(stats.email.deleted, 0);
+    assert_eq!(stats.email.created, 0);
+
+    // SQLite reflects merged keywords + new path.
+    let e_sent_after = db
+        .get_all_emails()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.jmap_id.as_deref() == Some("e-sent"))
+        .unwrap();
+    assert_eq!(
+        e_sent_after.keywords.as_deref(),
+        Some(r#"{"$seen":true}"#),
+        "SQLite keywords should reflect the pushed state"
+    );
+    assert!(
+        e_sent_after.file_path.ends_with(":2,S"),
+        "SQLite file_path should follow the notmuch rename: {}",
+        e_sent_after.file_path
+    );
+
+    // Verify wire saw Email/set update with keywords/$seen=true patch.
+    let body = last_email_set_body(&server).await;
+    let update = &body["methodCalls"][0][1]["update"]["e-sent"];
+    assert_eq!(
+        update["keywords/$seen"],
+        json!(true),
+        "Email/set update must set $seen=true, got {body}"
+    );
+}

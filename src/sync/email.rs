@@ -5,10 +5,10 @@ use crate::db::{
 use anyhow::{Context, Result};
 use jmap_client::Get;
 use jmap_client::client::Client;
-use jmap_client::core::response::EmailGetResponse;
+use jmap_client::core::response::{EmailGetResponse, EmailSetResponse};
 use jmap_client::email::{self, Email, Property};
 use log::{debug, info, warn};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,11 @@ pub struct EmailSyncStats {
     pub moved: usize,
     pub deleted: usize,
     pub bytes_downloaded: u64,
+    // Write-back counters: local changes we pushed upstream this tick.
+    // destroyed_upstream: aerc deleted a file → we told the server to destroy.
+    // updated_upstream:   maildir flag suffix drift → we pushed new keywords.
+    pub destroyed_upstream: usize,
+    pub updated_upstream: usize,
 }
 
 pub async fn sync_emails(
@@ -63,15 +68,36 @@ pub async fn sync_emails(
     // TODO(perf): switch to Email/changes when we have a stored state
     // cursor. Full-fetch every sync scales poorly past a few thousand
     // emails; needs the sync_state kv table + first-sync state anchor.
-    let server_ids = fetch_all_email_ids(client, &mailbox_by_jmap).await?;
+    let mut server_ids = fetch_all_email_ids(client, &mailbox_by_jmap).await?;
 
-    let local_by_jmap: HashMap<String, EmailRow> = db
+    let mut local_by_jmap: HashMap<String, EmailRow> = db
         .get_all_emails()?
         .into_iter()
         .filter_map(|e| e.jmap_id.clone().map(|j| (j, e)))
         .collect();
 
     let mut stats = EmailSyncStats::default();
+
+    // Write-back pre-pass: push local Maildir changes upstream before the
+    // read-side reconcile. Two triggers per local row:
+    //   1. file no longer resolvable in Maildir → Email/set destroy
+    //   2. Maildir flag suffix (S/F/R/D) differs from stored keywords →
+    //      Email/set update with per-keyword patches (custom server-side
+    //      labels preserved).
+    // Runs before the delete pass so successful destroys land in server_ids
+    // and existing SQLite cleanup happens on the same tick.
+    let writeback = detect_local_writeback(mail_root, &local_by_jmap);
+    apply_writeback(
+        client,
+        db,
+        mail_root,
+        &writeback,
+        &mut server_ids,
+        &mut local_by_jmap,
+        &mut stats,
+        dry_run,
+    )
+    .await?;
 
     // Deletes: any local row whose jmap_id is not in the server set.
     for (jmap_id, row) in &local_by_jmap {
@@ -87,7 +113,17 @@ pub async fn sync_emails(
     hydration_order.sort();
     for chunk in hydration_order.chunks(EMAIL_GET_CHUNK_SIZE) {
         let hydrated = fetch_email_chunk(client, chunk).await?;
+        let requested: HashSet<&str> = chunk.iter().map(String::as_str).collect();
         for email in hydrated {
+            // Defensive: some servers echo extra results in Email/get list.
+            // Skip anything we didn't ask for so a stale echo of an id we
+            // just destroyed can't cause apply_email to re-materialise it.
+            if let Some(id) = email.id() {
+                if !requested.contains(id) {
+                    debug!("Email/get returned unrequested id {id}; skipping");
+                    continue;
+                }
+            }
             apply_email(
                 client,
                 db,
@@ -103,12 +139,14 @@ pub async fn sync_emails(
     }
 
     info!(
-        "{}email sync: {} new, {} updated, {} moved, {} deleted, {} bytes downloaded",
+        "{}email sync: {} new, {} updated, {} moved, {} deleted, {} destroyed upstream, {} keywords pushed, {} bytes downloaded",
         if dry_run { "[dry-run] " } else { "" },
         stats.created,
         stats.updated,
         stats.moved,
         stats.deleted,
+        stats.destroyed_upstream,
+        stats.updated_upstream,
         stats.bytes_downloaded,
     );
     Ok(stats)
@@ -486,6 +524,257 @@ fn move_email(
 }
 
 // ---------------------------------------------------------------------------
+// Write-back (local Maildir → JMAP)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalChange {
+    /// Local file gone (aerc :delete unlinked it) — push Email/set destroy.
+    Destroy { jmap_id: String },
+    /// Maildir suffix's standard flags (S/F/R/D) drifted from stored
+    /// keywords — push per-keyword Email/set update patches (leaves any
+    /// server-side custom labels alone) and rewrite SQLite to match.
+    UpdateKeywords {
+        jmap_id: String,
+        /// Canonical alphabetical subset of the maildir suffix, filtered
+        /// to just the KEYWORD_MAP letters. Non-standard flags like T are
+        /// stripped so we don't ping-pong on flags the server doesn't
+        /// echo back.
+        new_flags: String,
+        /// Fully-merged keywords JSON for SQLite: stored non-standard
+        /// keywords preserved, standard subset replaced from disk.
+        new_keywords_json: String,
+        /// Actual on-disk path — may differ from row.file_path if notmuch
+        /// renamed the file when its flags changed.
+        new_rel_path: String,
+    },
+}
+
+fn detect_local_writeback(
+    mail_root: &Path,
+    local_by_jmap: &HashMap<String, EmailRow>,
+) -> Vec<LocalChange> {
+    let mut out = Vec::new();
+    for (jmap_id, row) in local_by_jmap {
+        match resolve_current_file(mail_root, &row.file_path) {
+            None => {
+                out.push(LocalChange::Destroy {
+                    jmap_id: jmap_id.clone(),
+                });
+            }
+            Some((actual_rel, actual_flags)) => {
+                let disk_flags: String = actual_flags
+                    .chars()
+                    .filter(|c| KEYWORD_MAP.iter().any(|(_, f)| f == c))
+                    .collect();
+                let stored_json = row.keywords.as_deref().unwrap_or("{}");
+                let merged_json = merge_keywords_json(stored_json, &disk_flags);
+                if merged_json != stored_json {
+                    out.push(LocalChange::UpdateKeywords {
+                        jmap_id: jmap_id.clone(),
+                        new_flags: disk_flags,
+                        new_keywords_json: merged_json,
+                        new_rel_path: actual_rel,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn apply_writeback(
+    client: &Client,
+    db: &Database,
+    mail_root: &Path,
+    changes: &[LocalChange],
+    server_ids: &mut HashSet<String>,
+    local_by_jmap: &mut HashMap<String, EmailRow>,
+    stats: &mut EmailSyncStats,
+    dry_run: bool,
+) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        for c in changes {
+            match c {
+                LocalChange::Destroy { jmap_id } => {
+                    debug!("[dry-run] would destroy {jmap_id} upstream");
+                    stats.destroyed_upstream += 1;
+                }
+                LocalChange::UpdateKeywords { jmap_id, new_flags, .. } => {
+                    debug!(
+                        "[dry-run] would push keywords for {jmap_id} (flags={new_flags:?})"
+                    );
+                    stats.updated_upstream += 1;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let mut request = client.build();
+    crate::jmap::restrict_using(&mut request);
+    let set = request.set_email();
+
+    let mut destroy_ids: Vec<String> = Vec::new();
+    for c in changes {
+        match c {
+            LocalChange::Destroy { jmap_id } => destroy_ids.push(jmap_id.clone()),
+            LocalChange::UpdateKeywords { jmap_id, new_flags, .. } => {
+                let update = set.update(jmap_id.as_str());
+                for (kw, ch) in KEYWORD_MAP {
+                    update.keyword(kw, new_flags.contains(*ch));
+                }
+            }
+        }
+    }
+    if !destroy_ids.is_empty() {
+        set.destroy(destroy_ids.iter().cloned());
+    }
+
+    let mut response = request
+        .send_single::<EmailSetResponse>()
+        .await
+        .context("Email/set write-back")?;
+
+    let destroyed: HashSet<String> = response
+        .take_destroyed_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let not_destroyed_count = response
+        .not_destroyed_ids()
+        .map(|it| it.count())
+        .unwrap_or(0);
+    let updated_ids: HashSet<String> = response
+        .take_updated_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let not_updated_count = response
+        .not_updated_ids()
+        .map(|it| it.count())
+        .unwrap_or(0);
+
+    if not_destroyed_count > 0 {
+        warn!(
+            "write-back: {} destroy request(s) rejected by server; will retry next tick",
+            not_destroyed_count
+        );
+    }
+    if not_updated_count > 0 {
+        warn!(
+            "write-back: {} keyword update(s) rejected by server; will retry next tick",
+            not_updated_count
+        );
+    }
+
+    // Reconcile local state with what the server actually did. For
+    // successful destroys, apply_writeback owns the entire local cleanup:
+    // drop the id from server_ids (so the delete pass + hydrate loop skip
+    // it), remove it from local_by_jmap (so any stragglers Email/get echoes
+    // don't cause apply_email to reconcile against a phantom SQLite row),
+    // and call delete_email to unlink the local SQLite row + any residual
+    // file. stats.deleted stays 0 for these — they're counted under
+    // stats.destroyed_upstream, semantically distinct from server-initiated
+    // deletes.
+    for c in changes {
+        match c {
+            LocalChange::Destroy { jmap_id } => {
+                if destroyed.contains(jmap_id) {
+                    server_ids.remove(jmap_id);
+                    if let Some(row) = local_by_jmap.remove(jmap_id) {
+                        delete_email(db, mail_root, &row, false)?;
+                    }
+                    stats.destroyed_upstream += 1;
+                    debug!("write-back: destroyed {jmap_id} upstream");
+                }
+            }
+            LocalChange::UpdateKeywords {
+                jmap_id,
+                new_keywords_json,
+                new_rel_path,
+                ..
+            } => {
+                if updated_ids.contains(jmap_id) {
+                    if let Some(row) = local_by_jmap.get_mut(jmap_id) {
+                        row.keywords = Some(new_keywords_json.clone());
+                        row.file_path = new_rel_path.clone();
+                        row.last_sync = Some(unix_now());
+                        db.update_email(row)?;
+                    }
+                    stats.updated_upstream += 1;
+                    debug!("write-back: pushed keywords for {jmap_id}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Locate the actual on-disk file matching the stored relative path's
+/// `{ts}.{uuid}` base, regardless of `:2,` suffix drift caused by notmuch
+/// flag synchronisation. Returns None if no file with the same base can
+/// be found in the stored parent directory.
+fn resolve_current_file(mail_root: &Path, stored_rel: &str) -> Option<(String, String)> {
+    let stored_abs = mail_root.join(stored_rel);
+    let parent = stored_abs.parent()?;
+    let stored_name = stored_abs.file_name()?.to_str()?;
+    let stored_base = filename_base(stored_name);
+
+    for entry in std::fs::read_dir(parent).ok()? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name_os = entry.file_name();
+        let name = match name_os.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if filename_base(name) == stored_base {
+            let rel = entry
+                .path()
+                .strip_prefix(mail_root)
+                .ok()?
+                .to_string_lossy()
+                .into_owned();
+            return Some((rel, filename_flags(name).to_string()));
+        }
+    }
+    None
+}
+
+fn filename_base(name: &str) -> &str {
+    name.rsplit_once(":2,").map(|(b, _)| b).unwrap_or(name)
+}
+
+fn filename_flags(name: &str) -> &str {
+    name.rsplit_once(":2,").map(|(_, f)| f).unwrap_or("")
+}
+
+/// Merge the standard-subset keyword state (from `disk_flags`) into the
+/// full stored keyword JSON, preserving any non-standard server-side
+/// labels. Output is deterministic (BTreeMap key ordering).
+fn merge_keywords_json(stored_json: &str, disk_flags: &str) -> String {
+    let mut merged: BTreeMap<String, bool> =
+        serde_json::from_str(stored_json).unwrap_or_default();
+    for (kw, _) in KEYWORD_MAP {
+        merged.remove(*kw);
+    }
+    for (kw, ch) in KEYWORD_MAP {
+        if disk_flags.contains(*ch) {
+            merged.insert((*kw).to_string(), true);
+        }
+    }
+    serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // DELETE
 // ---------------------------------------------------------------------------
 
@@ -860,5 +1149,162 @@ mod tests {
         assert!(role_rank(Some("inbox")) < role_rank(Some("sent")));
         assert!(role_rank(Some("junk")) < role_rank(None));
         assert!(role_rank(Some("unknown-role")) == role_rank(None));
+    }
+
+    // -----------------------------------------------------------------
+    // Write-back helpers
+    // -----------------------------------------------------------------
+
+    fn touch(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, b"body").unwrap();
+    }
+
+    fn row_with(jmap_id: &str, file_path: &str, keywords_json: &str) -> EmailRow {
+        EmailRow {
+            id: format!("l-{jmap_id}"),
+            jmap_id: Some(jmap_id.to_string()),
+            message_id: None,
+            file_path: file_path.to_string(),
+            primary_mailbox: "mb-inbox".to_string(),
+            keywords: Some(keywords_json.to_string()),
+            jmap_state: None,
+            size: Some(100),
+            last_sync: None,
+            is_dirty: false,
+        }
+    }
+
+    #[test]
+    fn filename_base_and_flags_parse() {
+        assert_eq!(filename_base("12345.abc-def:2,FS"), "12345.abc-def");
+        assert_eq!(filename_flags("12345.abc-def:2,FS"), "FS");
+        assert_eq!(filename_base("12345.abc-def:2,"), "12345.abc-def");
+        assert_eq!(filename_flags("12345.abc-def:2,"), "");
+        assert_eq!(filename_base("no-suffix"), "no-suffix");
+        assert_eq!(filename_flags("no-suffix"), "");
+    }
+
+    #[test]
+    fn merge_keywords_preserves_non_standard() {
+        // $notjunk is server-side custom, must survive.
+        assert_eq!(
+            merge_keywords_json(r#"{"$notjunk":true,"$seen":true}"#, "F"),
+            r#"{"$flagged":true,"$notjunk":true}"#
+        );
+        // Empty on-disk flags clears standard subset entirely.
+        assert_eq!(
+            merge_keywords_json(r#"{"$notjunk":true,"$seen":true}"#, ""),
+            r#"{"$notjunk":true}"#
+        );
+        // Every standard flag round-trips.
+        assert_eq!(
+            merge_keywords_json("{}", "SFRD"),
+            r#"{"$answered":true,"$draft":true,"$flagged":true,"$seen":true}"#
+        );
+    }
+
+    #[test]
+    fn resolve_current_file_finds_renamed_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Actual file lives at :2,S (notmuch added Seen); stored path is
+        // stale at :2, (what jmapsyncd last wrote).
+        touch(&root.join("Inbox/cur/12345.abc:2,S"));
+
+        let hit = resolve_current_file(root, "Inbox/cur/12345.abc:2,").unwrap();
+        assert_eq!(hit.0, "Inbox/cur/12345.abc:2,S");
+        assert_eq!(hit.1, "S");
+    }
+
+    #[test]
+    fn resolve_current_file_missing_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Inbox/cur")).unwrap();
+        assert!(
+            resolve_current_file(tmp.path(), "Inbox/cur/12345.abc:2,").is_none()
+        );
+    }
+
+    #[test]
+    fn detect_writeback_destroy_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Inbox/cur")).unwrap();
+        let mut local = HashMap::new();
+        local.insert(
+            "e-gone".to_string(),
+            row_with("e-gone", "Inbox/cur/1.aaa:2,", "{}"),
+        );
+
+        let changes = detect_local_writeback(tmp.path(), &local);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0],
+            LocalChange::Destroy {
+                jmap_id: "e-gone".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn detect_writeback_update_when_flag_added() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(&tmp.path().join("Inbox/cur/1.aaa:2,S"));
+        let mut local = HashMap::new();
+        local.insert(
+            "e-read".to_string(),
+            row_with("e-read", "Inbox/cur/1.aaa:2,", "{}"),
+        );
+
+        let changes = detect_local_writeback(tmp.path(), &local);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::UpdateKeywords {
+                jmap_id,
+                new_flags,
+                new_keywords_json,
+                new_rel_path,
+            } => {
+                assert_eq!(jmap_id, "e-read");
+                assert_eq!(new_flags, "S");
+                assert_eq!(new_keywords_json, r#"{"$seen":true}"#);
+                assert_eq!(new_rel_path, "Inbox/cur/1.aaa:2,S");
+            }
+            other => panic!("expected UpdateKeywords, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_writeback_noop_when_flags_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(&tmp.path().join("Inbox/cur/1.aaa:2,S"));
+        let mut local = HashMap::new();
+        local.insert(
+            "e-noop".to_string(),
+            row_with("e-noop", "Inbox/cur/1.aaa:2,S", r#"{"$seen":true}"#),
+        );
+
+        let changes = detect_local_writeback(tmp.path(), &local);
+        assert!(changes.is_empty(), "no drift, no change: {changes:?}");
+    }
+
+    #[test]
+    fn detect_writeback_ignores_non_standard_flags() {
+        // aerc :delete → notmuch may add T (Trashed) on some paths; the
+        // T bit isn't in KEYWORD_MAP, so if T is the only difference we
+        // should NOT push a keyword update. (True aerc :delete unlinks
+        // the file entirely, which is the Destroy path.)
+        let tmp = tempfile::tempdir().unwrap();
+        touch(&tmp.path().join("Inbox/cur/1.aaa:2,ST"));
+        let mut local = HashMap::new();
+        local.insert(
+            "e-t".to_string(),
+            row_with("e-t", "Inbox/cur/1.aaa:2,S", r#"{"$seen":true}"#),
+        );
+
+        let changes = detect_local_writeback(tmp.path(), &local);
+        assert!(changes.is_empty(), "T flag alone must not trigger writeback");
     }
 }
