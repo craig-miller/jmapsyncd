@@ -119,6 +119,14 @@ pub struct MailConfig {
     pub box_mapping: Vec<BoxMapping>,
     #[serde(default)]
     pub post_sync_hook: Option<String>,
+    /// When true (the default), the daemon watches the Maildir tree via
+    /// inotify and triggers a sync tick whenever anything under it is
+    /// created, renamed, or removed. Debounced 500ms to coalesce bursts.
+    /// Disable for poll-only environments (containers with no inotify
+    /// support, or when the local Maildir is a mount that doesn't emit
+    /// events like some FUSE/NFS setups).
+    #[serde(default = "helpers::default_true")]
+    pub watch_maildir: bool,
 }
 
 // ---------------------------------------------------------------------------

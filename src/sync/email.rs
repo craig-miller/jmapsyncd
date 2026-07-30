@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_writeback_ignores_non_standard_flags_when_no_T() {
+    fn detect_writeback_ignores_non_standard_flags_when_no_t() {
         // Passed (P) and other non-standard maildir letters that notmuch
         // doesn't own must not trigger keyword drift (they aren't in
         // KEYWORD_MAP so we can't round-trip them anyway).

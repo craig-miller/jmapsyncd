@@ -529,6 +529,7 @@ mod tests {
             tls: None,
             box_mapping: Vec::new(),
             post_sync_hook: None,
+            watch_maildir: false,
         }
     }
 

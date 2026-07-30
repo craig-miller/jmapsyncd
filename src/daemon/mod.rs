@@ -6,8 +6,11 @@ use jmap_client::DataType;
 use jmap_client::client::Client;
 use jmap_client::event_source::PushNotification;
 use log::{debug, error, info, warn};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::path::Path;
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +19,7 @@ use crate::config::Config;
 const SSE_CONNECT_BACKOFF: Duration = Duration::from_secs(5);
 const SSE_STREAM_DROP_BACKOFF: Duration = Duration::from_secs(1);
 const SSE_PING_SECONDS: u32 = 60;
+const MAILDIR_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Long-running SSE loop for one account. Never returns while `cancel` is
 /// live; exits cleanly when the token fires.
@@ -31,6 +35,20 @@ pub async fn run_account_sse_loop(
 ) {
     let acct_name = acct.name.clone();
     let mut last_event_id: Option<String> = None;
+
+    // Optional Maildir watcher — the local-side counterpart to SSE. Fires
+    // a sync tick whenever anything under the Maildir tree changes so that
+    // a client (aerc, notmuch, mutt, plain rm) causing a local mutation
+    // reaches JMAP within a debounce window (~500ms) instead of waiting
+    // for the SSE-silent poll fallback. Held here for the loop's lifetime
+    // so the underlying inotify subscription stays live across reconnects.
+    let mut watch = match spawn_maildir_watch_for_account(&acct, cancel.clone()) {
+        Ok(rx) => rx,
+        Err(e) => {
+            warn!("[{acct_name}] maildir watch setup failed: {e:#}; continuing poll-only");
+            None
+        }
+    };
 
     loop {
         if cancel.is_cancelled() {
@@ -98,6 +116,12 @@ pub async fn run_account_sse_loop(
                         error!("[{acct_name}] poll-triggered sync failed: {e:#}");
                     }
                 }
+                _ = maybe_watch(watch.as_mut()) => {
+                    debug!("[{acct_name}] maildir change detected; triggering sync");
+                    if let Err(e) = sync::sync_account(&client, &acct, &db, false).await {
+                        error!("[{acct_name}] watch-triggered sync failed: {e:#}");
+                    }
+                }
                 item = stream.next() => {
                     match item {
                         None => {
@@ -140,6 +164,103 @@ async fn maybe_tick(interval: Option<&mut tokio::time::Interval>) {
         }
         None => std::future::pending::<()>().await,
     }
+}
+
+/// Same shape as `maybe_tick` but for the Maildir watcher's debounced
+/// channel: when the watcher isn't set up (no `[accounts.mail]` section
+/// or `watch_maildir = false`), the arm stays inert forever.
+async fn maybe_watch(rx: Option<&mut MaildirWatchRx>) {
+    match rx {
+        Some(r) => {
+            let _ = r.rx.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Owns the notify Watcher (kept alive so its inotify subscription
+/// doesn't drop) plus the debounced tick channel the SSE loop reads.
+/// The watcher itself talks on its own OS thread; the debouncer task
+/// coalesces bursts into one signal per MAILDIR_DEBOUNCE window.
+struct MaildirWatchRx {
+    _watcher: RecommendedWatcher,
+    rx: mpsc::Receiver<()>,
+}
+
+fn spawn_maildir_watch_for_account(
+    acct: &Account,
+    cancel: CancellationToken,
+) -> anyhow::Result<Option<MaildirWatchRx>> {
+    let Some(mail_cfg) = acct.mail.as_ref() else {
+        return Ok(None);
+    };
+    if !mail_cfg.watch_maildir {
+        return Ok(None);
+    }
+    let w = spawn_maildir_watch(&mail_cfg.path, MAILDIR_DEBOUNCE, cancel)?;
+    info!(
+        "[{}] watching maildir {} for local changes (debounce {}ms)",
+        acct.name,
+        mail_cfg.path.display(),
+        MAILDIR_DEBOUNCE.as_millis()
+    );
+    Ok(Some(w))
+}
+
+fn spawn_maildir_watch(
+    mail_path: &Path,
+    debounce: Duration,
+    cancel: CancellationToken,
+) -> anyhow::Result<MaildirWatchRx> {
+    // Raw notify events land in `raw_tx`; the debouncer coalesces them
+    // into `tick_tx`, which the SSE loop consumes. Bounded channels: if
+    // the sync tick backs up, dropping newer events is fine — the next
+    // tick reads full state from disk anyway.
+    let (raw_tx, mut raw_rx) = mpsc::channel::<()>(64);
+    let (tick_tx, tick_rx) = mpsc::channel::<()>(4);
+
+    let mut watcher: RecommendedWatcher = notify::recommended_watcher(
+        move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            if matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            ) {
+                // blocking_send from notify's OS thread — the tokio
+                // channel's blocking API is what this is for. try_send
+                // would drop under a full buffer; we want at-least-one
+                // signal per burst, so accept a brief block on the
+                // notify thread.
+                let _ = raw_tx.blocking_send(());
+            }
+        },
+    )?;
+    watcher.watch(mail_path, RecursiveMode::Recursive)?;
+
+    spawn_local(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                first = raw_rx.recv() => {
+                    if first.is_none() {
+                        return;
+                    }
+                    // Wait out the debounce, then drain everything else
+                    // that piled up — one tick per burst.
+                    tokio::time::sleep(debounce).await;
+                    while raw_rx.try_recv().is_ok() {}
+                    if tick_tx.send(()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(MaildirWatchRx {
+        _watcher: watcher,
+        rx: tick_rx,
+    })
 }
 
 /// Sleep for `d`, or return early if cancelled — never let the loop wait
