@@ -529,8 +529,19 @@ fn move_email(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalChange {
-    /// Local file gone (aerc :delete unlinked it) — push Email/set destroy.
-    Destroy { jmap_id: String },
+    /// Push Email/set destroy. Two ways to reach this:
+    ///
+    /// - File is truly unlinked (some clients rm the maildir file directly),
+    ///   `actual_rel` = None.
+    /// - File carries the maildir `T` (Trashed) flag — the aerc/notmuch
+    ///   idiom: `:delete` adds the `deleted` notmuch tag, and with
+    ///   `synchronize_flags=true` notmuch renames the file to add `T`.
+    ///   The file stays on disk until we destroy it here. `actual_rel`
+    ///   points to the renamed file so the destroy path can unlink it.
+    Destroy {
+        jmap_id: String,
+        actual_rel: Option<String>,
+    },
     /// Maildir suffix's standard flags (S/F/R/D) drifted from stored
     /// keywords — push per-keyword Email/set update patches (leaves any
     /// server-side custom labels alone) and rewrite SQLite to match.
@@ -560,9 +571,20 @@ fn detect_local_writeback(
             None => {
                 out.push(LocalChange::Destroy {
                     jmap_id: jmap_id.clone(),
+                    actual_rel: None,
                 });
             }
             Some((actual_rel, actual_flags)) => {
+                // aerc :delete → notmuch tag +deleted → (synchronize_flags=true)
+                // notmuch renames the file to add T. Treat T on disk as a
+                // client-issued destroy request.
+                if actual_flags.contains('T') {
+                    out.push(LocalChange::Destroy {
+                        jmap_id: jmap_id.clone(),
+                        actual_rel: Some(actual_rel),
+                    });
+                    continue;
+                }
                 let disk_flags: String = actual_flags
                     .chars()
                     .filter(|c| KEYWORD_MAP.iter().any(|(_, f)| f == c))
@@ -600,7 +622,7 @@ async fn apply_writeback(
     if dry_run {
         for c in changes {
             match c {
-                LocalChange::Destroy { jmap_id } => {
+                LocalChange::Destroy { jmap_id, .. } => {
                     debug!("[dry-run] would destroy {jmap_id} upstream");
                     stats.destroyed_upstream += 1;
                 }
@@ -622,7 +644,7 @@ async fn apply_writeback(
     let mut destroy_ids: Vec<String> = Vec::new();
     for c in changes {
         match c {
-            LocalChange::Destroy { jmap_id } => destroy_ids.push(jmap_id.clone()),
+            LocalChange::Destroy { jmap_id, .. } => destroy_ids.push(jmap_id.clone()),
             LocalChange::UpdateKeywords { jmap_id, new_flags, .. } => {
                 let update = set.update(jmap_id.as_str());
                 for (kw, ch) in KEYWORD_MAP {
@@ -683,10 +705,18 @@ async fn apply_writeback(
     // deletes.
     for c in changes {
         match c {
-            LocalChange::Destroy { jmap_id } => {
+            LocalChange::Destroy { jmap_id, actual_rel } => {
                 if destroyed.contains(jmap_id) {
                     server_ids.remove(jmap_id);
-                    if let Some(row) = local_by_jmap.remove(jmap_id) {
+                    if let Some(mut row) = local_by_jmap.remove(jmap_id) {
+                        // If notmuch renamed the file (T-flag case),
+                        // point delete_email at the actual on-disk path so
+                        // the unlink hits the right file. Falls back to
+                        // the stored path (already-unlinked case is a
+                        // no-op inside delete_email).
+                        if let Some(actual) = actual_rel {
+                            row.file_path = actual.clone();
+                        }
                         delete_email(db, mail_root, &row, false)?;
                     }
                     stats.destroyed_upstream += 1;
@@ -1244,6 +1274,32 @@ mod tests {
             changes[0],
             LocalChange::Destroy {
                 jmap_id: "e-gone".to_string(),
+                actual_rel: None,
+            }
+        );
+    }
+
+    #[test]
+    fn detect_writeback_destroy_when_file_trashed_by_notmuch() {
+        // aerc :delete via notmuch backend: tag +deleted → (synchronize_flags
+        // = true) notmuch renames the file to append T. jmapsyncd must
+        // treat T on disk as a client-issued destroy request and unlink
+        // the renamed file, not just leave it lying around.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(&tmp.path().join("Inbox/cur/1.aaa:2,ST"));
+        let mut local = HashMap::new();
+        local.insert(
+            "e-trashed".to_string(),
+            row_with("e-trashed", "Inbox/cur/1.aaa:2,S", r#"{"$seen":true}"#),
+        );
+
+        let changes = detect_local_writeback(tmp.path(), &local);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0],
+            LocalChange::Destroy {
+                jmap_id: "e-trashed".to_string(),
+                actual_rel: Some("Inbox/cur/1.aaa:2,ST".to_string()),
             }
         );
     }
@@ -1291,20 +1347,22 @@ mod tests {
     }
 
     #[test]
-    fn detect_writeback_ignores_non_standard_flags() {
-        // aerc :delete → notmuch may add T (Trashed) on some paths; the
-        // T bit isn't in KEYWORD_MAP, so if T is the only difference we
-        // should NOT push a keyword update. (True aerc :delete unlinks
-        // the file entirely, which is the Destroy path.)
+    fn detect_writeback_ignores_non_standard_flags_when_no_T() {
+        // Passed (P) and other non-standard maildir letters that notmuch
+        // doesn't own must not trigger keyword drift (they aren't in
+        // KEYWORD_MAP so we can't round-trip them anyway).
         let tmp = tempfile::tempdir().unwrap();
-        touch(&tmp.path().join("Inbox/cur/1.aaa:2,ST"));
+        touch(&tmp.path().join("Inbox/cur/1.aaa:2,PS"));
         let mut local = HashMap::new();
         local.insert(
-            "e-t".to_string(),
-            row_with("e-t", "Inbox/cur/1.aaa:2,S", r#"{"$seen":true}"#),
+            "e-p".to_string(),
+            row_with("e-p", "Inbox/cur/1.aaa:2,S", r#"{"$seen":true}"#),
         );
 
         let changes = detect_local_writeback(tmp.path(), &local);
-        assert!(changes.is_empty(), "T flag alone must not trigger writeback");
+        assert!(
+            changes.is_empty(),
+            "non-T non-standard flags must not trigger writeback: {changes:?}"
+        );
     }
 }
