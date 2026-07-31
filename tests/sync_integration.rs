@@ -298,7 +298,9 @@ fn build_account(jmap_host: &str, mail_path: PathBuf) -> Account {
             box_mapping: Vec::new(),
             post_sync_hook: None,
             watch_maildir: false,
+            exclude_mailboxes: Vec::new(),
         }),
+        submit: None,
     }
 }
 

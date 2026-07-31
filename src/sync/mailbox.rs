@@ -42,8 +42,14 @@ pub async fn sync_mailboxes(
         .filter_map(|m| m.jmap_id.clone().map(|j| (j, m.clone())))
         .collect();
 
-    let mut stats =
-        apply_diff(db, &mail_cfg.path, &target_set, &local_by_jmap, dry_run)?;
+    let mut stats = apply_diff(
+        db,
+        &mail_cfg.path,
+        &target_set,
+        &local_by_jmap,
+        &mail_cfg.exclude_mailboxes,
+        dry_run,
+    )?;
     stats.orphaned_emails = cleanup_orphaned_emails(db, &mail_cfg.path, dry_run)?;
 
     info!(
@@ -224,17 +230,25 @@ fn apply_diff(
     mail_root: &Path,
     target: &HashMap<String, TargetMailbox>,
     local_by_jmap: &HashMap<String, MailboxRow>,
+    exclude_mailboxes: &[String],
     dry_run: bool,
 ) -> Result<MailboxSyncStats> {
     let mut stats = MailboxSyncStats::default();
+    let excluded: HashSet<&str> =
+        exclude_mailboxes.iter().map(String::as_str).collect();
 
     // Deletes (children first) — anything local that fell out of the target
     // set. Includes both server-side deletes and mailboxes that were
     // filtered out (e.g. user changed box_filter, or unsubscribed on server
-    // with subscribed_only=true).
+    // with subscribed_only=true). Names in `exclude_mailboxes` are
+    // client-only Maildir folders (Outbox/Failed for the send path) — the
+    // sync engine must never delete them just because they aren't on the
+    // server.
     let mut to_delete: Vec<&MailboxRow> = local_by_jmap
         .iter()
-        .filter(|(jmap_id, _)| !target.contains_key(*jmap_id))
+        .filter(|(jmap_id, row)| {
+            !target.contains_key(*jmap_id) && !excluded.contains(row.path.as_str())
+        })
         .map(|(_, row)| row)
         .collect();
     // Deepest paths first — parents can only be removed after their children.
@@ -530,6 +544,7 @@ mod tests {
             box_mapping: Vec::new(),
             post_sync_hook: None,
             watch_maildir: false,
+            exclude_mailboxes: Vec::new(),
         }
     }
 
@@ -829,5 +844,85 @@ mod tests {
         assert!(gs.is_match("INBOX"));
         assert!(gs.is_match("INBOXfoo"));
         assert!(!gs.is_match("Sent"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Send-path Phase B: exclude_mailboxes wiring for apply_diff delete step
+    // -----------------------------------------------------------------------
+
+    fn stub_mailbox_row(name_and_path: &str, jmap_id: &str) -> MailboxRow {
+        MailboxRow {
+            id: generate_id(),
+            jmap_id: Some(jmap_id.to_string()),
+            name: name_and_path.to_string(),
+            parent_id: None,
+            role: None,
+            sort_order: Some(0),
+            path: name_and_path.to_string(),
+            jmap_state: None,
+        }
+    }
+
+    #[test]
+    fn apply_diff_deletes_when_no_exclude_list() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mb = stub_mailbox_row("Stale", "j-stale");
+        db.insert_mailbox(&mb).unwrap();
+        create_maildir(&tmp.path().join("Stale")).unwrap();
+
+        let mut local_by_jmap = HashMap::new();
+        local_by_jmap.insert(mb.jmap_id.clone().unwrap(), mb.clone());
+        let target: HashMap<String, TargetMailbox> = HashMap::new();
+
+        let stats = apply_diff(&db, tmp.path(), &target, &local_by_jmap, &[], false).unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert!(!tmp.path().join("Stale").exists());
+        assert!(db.get_mailbox(&mb.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_diff_skips_excluded_mailbox_on_delete() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mb = stub_mailbox_row("Outbox", "j-outbox");
+        db.insert_mailbox(&mb).unwrap();
+        create_maildir(&tmp.path().join("Outbox")).unwrap();
+
+        let mut local_by_jmap = HashMap::new();
+        local_by_jmap.insert(mb.jmap_id.clone().unwrap(), mb.clone());
+        let target: HashMap<String, TargetMailbox> = HashMap::new();
+        let excludes = vec!["Outbox".to_string(), "Failed".to_string()];
+
+        let stats =
+            apply_diff(&db, tmp.path(), &target, &local_by_jmap, &excludes, false).unwrap();
+        assert_eq!(stats.deleted, 0, "excluded mailbox must not be deleted");
+        assert!(tmp.path().join("Outbox").exists(), "Maildir must survive");
+        assert!(
+            db.get_mailbox(&mb.id).unwrap().is_some(),
+            "DB row must survive"
+        );
+    }
+
+    #[test]
+    fn apply_diff_exclude_only_matches_top_level_path_exactly() {
+        // Excludes are exact top-level-name matches, not prefix matches.
+        // A local mailbox named "OutboxNotes" should NOT be spared by an
+        // "Outbox" exclude.
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mb = stub_mailbox_row("OutboxNotes", "j-notes");
+        db.insert_mailbox(&mb).unwrap();
+        create_maildir(&tmp.path().join("OutboxNotes")).unwrap();
+
+        let mut local_by_jmap = HashMap::new();
+        local_by_jmap.insert(mb.jmap_id.clone().unwrap(), mb.clone());
+        let target: HashMap<String, TargetMailbox> = HashMap::new();
+        let excludes = vec!["Outbox".to_string()];
+
+        let stats =
+            apply_diff(&db, tmp.path(), &target, &local_by_jmap, &excludes, false).unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert!(!tmp.path().join("OutboxNotes").exists());
     }
 }

@@ -23,7 +23,7 @@ impl Config {
                 .join("jmapsyncd")
                 .join("config.toml"),
         };
-        let file_config = ConfigFile::load(&config_path)?;
+        let mut file_config = ConfigFile::load(&config_path)?;
 
         let db_dir = match overrides.db_dir.clone().or(file_config.db_dir) {
             Some(d) => d,
@@ -31,6 +31,23 @@ impl Config {
                 .context("no platform data directory available; use --db-dir to specify a path")?
                 .join("jmapsyncd"),
         };
+
+        // Post-process: if an account declares a [accounts.submit] block
+        // (send path in play), default its Maildir's exclude_mailboxes list
+        // to Outbox + Failed. These are client-only Maildir folders that
+        // jmapqueue writes into locally; the sync engine must not touch
+        // them in either direction. Users can override with an explicit
+        // list (including an empty one).
+        for account in &mut file_config.accounts {
+            if account.submit.is_some() {
+                if let Some(mail) = account.mail.as_mut() {
+                    if mail.exclude_mailboxes.is_empty() {
+                        mail.exclude_mailboxes =
+                            vec!["Outbox".to_string(), "Failed".to_string()];
+                    }
+                }
+            }
+        }
 
         Ok(Config {
             db_dir,
@@ -83,6 +100,7 @@ pub struct Account {
     #[serde(default = "helpers::default_poll_interval_secs")]
     pub poll_interval_secs: u64,
     pub mail: Option<MailConfig>,
+    pub submit: Option<SubmitConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +145,13 @@ pub struct MailConfig {
     /// events like some FUSE/NFS setups).
     #[serde(default = "helpers::default_true")]
     pub watch_maildir: bool,
+    /// Local Maildir folder names that the sync engine must ignore in both
+    /// directions: never create/prune them from Mailbox/get diffs, never
+    /// upload their contents via write-back. Populated automatically to
+    /// ["Outbox", "Failed"] when [accounts.submit] is present and the user
+    /// hasn't set the list explicitly (see Config::load).
+    #[serde(default)]
+    pub exclude_mailboxes: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +174,67 @@ pub struct TlsConfig {
 pub struct BoxMapping {
     pub remote: String,
     pub local: String,
+}
+
+// ---------------------------------------------------------------------------
+// SubmitConfig — per-account send-path settings (jmapqueue + daemon Outbox
+// watcher). Presence of this block flips exclude_mailboxes defaults in the
+// account's MailConfig (see Config::load).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitConfig {
+    /// Author address stamped on outbound mail. jmapqueue also uses this
+    /// to match a message's From: header to an account when routing.
+    pub from_address: String,
+    /// Optional JMAP Identity id override. When absent, the daemon
+    /// resolves the primary identity on the account at startup.
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    /// Target folder for scheduled sends (sendAt in the future). See
+    /// ScheduledFolder for the accepted values.
+    #[serde(default)]
+    pub scheduled_folder: ScheduledFolder,
+    /// Base backoff for transient submission failures, in seconds. The
+    /// daemon doubles per attempt up to retry_cap_secs.
+    #[serde(default = "helpers::default_retry_base_secs")]
+    pub retry_base_secs: u64,
+    /// Cap on the exponential backoff, in seconds. Entries stay in the
+    /// Outbox and retry forever at this cap once reached.
+    #[serde(default = "helpers::default_retry_cap_secs")]
+    pub retry_cap_secs: u64,
+}
+
+/// On-success target folder for scheduled sends.
+///
+/// - `"auto"` (default): probe for a `Scheduled` mailbox at startup
+///   (Fastmail convention); use it if present, otherwise fall back to
+///   the account's Sent role folder.
+/// - `"sent"`: always file straight into Sent, regardless of sendAt.
+/// - anything else: treat as a literal mailbox name to file into. The
+///   daemon resolves the name to a mailbox id on startup; if it's
+///   absent, scheduled sends fall back to Sent with a warning.
+#[derive(Debug, Default, PartialEq, Clone)]
+pub enum ScheduledFolder {
+    #[default]
+    Auto,
+    Sent,
+    Named(String),
+}
+
+impl<'de> serde::Deserialize<'de> for ScheduledFolder {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "auto" => ScheduledFolder::Auto,
+            "sent" => ScheduledFolder::Sent,
+            _ => ScheduledFolder::Named(s),
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -217,6 +303,14 @@ pub(crate) mod helpers {
 
     pub fn default_poll_interval_secs() -> u64 {
         300
+    }
+
+    pub fn default_retry_base_secs() -> u64 {
+        30
+    }
+
+    pub fn default_retry_cap_secs() -> u64 {
+        7200
     }
 }
 
@@ -687,5 +781,231 @@ poll_interval_secs = 0
         )
         .unwrap();
         assert_eq!(config.accounts[0].poll_interval_secs, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Send-path Phase B: SubmitConfig + exclude_mailboxes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn submit_block_absent_leaves_none() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+"#,
+        )
+        .unwrap();
+        assert!(config.accounts[0].submit.is_none());
+    }
+
+    #[test]
+    fn submit_block_minimal_parses() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+
+[accounts.submit]
+from_address = "me@example.com"
+"#,
+        )
+        .unwrap();
+        let sub = config.accounts[0].submit.as_ref().unwrap();
+        assert_eq!(sub.from_address, "me@example.com");
+        assert!(sub.identity_id.is_none());
+        assert_eq!(sub.scheduled_folder, ScheduledFolder::Auto);
+        assert_eq!(sub.retry_base_secs, 30);
+        assert_eq!(sub.retry_cap_secs, 7200);
+    }
+
+    #[test]
+    fn submit_block_full_parses() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+
+[accounts.submit]
+from_address = "me@example.com"
+identity_id = "I123"
+scheduled_folder = "Later"
+retry_base_secs = 60
+retry_cap_secs = 3600
+"#,
+        )
+        .unwrap();
+        let sub = config.accounts[0].submit.as_ref().unwrap();
+        assert_eq!(sub.identity_id.as_deref(), Some("I123"));
+        assert_eq!(
+            sub.scheduled_folder,
+            ScheduledFolder::Named("Later".to_string())
+        );
+        assert_eq!(sub.retry_base_secs, 60);
+        assert_eq!(sub.retry_cap_secs, 3600);
+    }
+
+    #[test]
+    fn scheduled_folder_variants() {
+        fn parse(v: &str) -> ScheduledFolder {
+            let toml_str = format!(
+                r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+
+[accounts.submit]
+from_address = "me@example.com"
+scheduled_folder = "{v}"
+"#
+            );
+            let cfg: ConfigFile = toml::from_str(&toml_str).unwrap();
+            cfg.accounts[0]
+                .submit
+                .as_ref()
+                .unwrap()
+                .scheduled_folder
+                .clone()
+        }
+        assert_eq!(parse("auto"), ScheduledFolder::Auto);
+        assert_eq!(parse("sent"), ScheduledFolder::Sent);
+        assert_eq!(
+            parse("Scheduled"),
+            ScheduledFolder::Named("Scheduled".to_string())
+        );
+        assert_eq!(
+            parse("Later Today"),
+            ScheduledFolder::Named("Later Today".to_string())
+        );
+    }
+
+    #[test]
+    fn submit_rejects_unknown_fields() {
+        let result: Result<ConfigFile, _> = toml::from_str(
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+
+[accounts.submit]
+from_address = "me@example.com"
+bogus = 1
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exclude_mailboxes_defaults_empty_without_submit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+
+[accounts.mail]
+path = "/tmp/mail"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path), &Overrides::default()).unwrap();
+        let mail = cfg.accounts[0].mail.as_ref().unwrap();
+        assert!(mail.exclude_mailboxes.is_empty());
+    }
+
+    #[test]
+    fn exclude_mailboxes_defaults_outbox_failed_with_submit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+
+[accounts.mail]
+path = "/tmp/mail"
+
+[accounts.submit]
+from_address = "me@example.com"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path), &Overrides::default()).unwrap();
+        let mail = cfg.accounts[0].mail.as_ref().unwrap();
+        assert_eq!(mail.exclude_mailboxes, vec!["Outbox", "Failed"]);
+    }
+
+    #[test]
+    fn exclude_mailboxes_explicit_wins_over_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+
+[accounts.mail]
+path = "/tmp/mail"
+exclude_mailboxes = ["Queue", "Rejects"]
+
+[accounts.submit]
+from_address = "me@example.com"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path), &Overrides::default()).unwrap();
+        let mail = cfg.accounts[0].mail.as_ref().unwrap();
+        assert_eq!(mail.exclude_mailboxes, vec!["Queue", "Rejects"]);
+    }
+
+    #[test]
+    fn exclude_mailboxes_no_mail_no_op() {
+        // [accounts.submit] present but no [accounts.mail] — post-processing
+        // has nothing to touch; no panic, no side effects.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[accounts]]
+name = "test"
+jmap_host = "x.com"
+jmap_user = "u@x.com"
+jmap_token = "t"
+
+[accounts.submit]
+from_address = "me@example.com"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path), &Overrides::default()).unwrap();
+        assert!(cfg.accounts[0].mail.is_none());
+        assert!(cfg.accounts[0].submit.is_some());
     }
 }
