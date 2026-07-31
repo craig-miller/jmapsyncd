@@ -1,0 +1,25 @@
+# jmapsyncd send-path integration for aerc — merge into ~/.config/aerc/aerc.conf.
+#
+# `header-layout` stacks From/To/Cc/Bcc/Subject as first-class TUI
+# text-input widgets you Tab between in the compose window (aerc's
+# native widget model — not the edit-headers-in-buffer mode).
+#
+# X-JMAP-Send-At is NOT in the widget layout: the new_message template
+# seeds it invisibly with `send-now` (immediate delivery); the review
+# screen's `t` binding pops an fzf picker that rewrites it via aerc's
+# :header command.  Keeping it out of the compose bar avoids the
+# plain-letter-vs-text-entry collision (typing `t` in the To field
+# would trigger the picker if bound in [compose]).
+#
+# See binds.conf.snippet for the `t` schedule-picker binding.
+
+[compose]
+header-layout = From,To,Cc,Bcc,Subject
+
+[templates]
+new-message = new_message
+
+# Optional: run a post-send hook.  See mail-sent-hook.sh for an example
+# that notify-sends the account + subject after a successful :send.
+# [hooks]
+# mail-sent = ~/.config/aerc/mail-sent-hook.sh

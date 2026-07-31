@@ -1,0 +1,41 @@
+# jmapsyncd + notmuch backend for aerc.
+#
+# Prerequisites:
+#   - jmapsyncd daemon running and mirroring your JMAP account to
+#     ~/mail/<account>/ (see top-level README).
+#   - jmapqueue installed and on PATH (packaged with jmapsyncd).
+#   - notmuch installed; ~/.config/notmuch/default/config points at the
+#     Maildir root — see contrib/aerc/README.md §Setup: notmuch backend.
+#
+# Copy into ~/.config/aerc/accounts.conf and adjust the personal details.
+# Also create ~/.config/aerc/map.conf with the folder → notmuch-query map
+# (a sample is in contrib/aerc/README.md).
+
+[personal]
+source              = notmuch://
+query-map           = ~/.config/aerc/map.conf
+folders             = INBOX,Archive,Drafts,Sent,Spam,Trash,Unread
+multi-file-strategy = act-all
+default             = INBOX
+
+from                = Your Name <you@example.com>
+copy-to             = Sent
+postpone            = Drafts
+archive             = Archive
+
+# Send path — aerc invokes this like sendmail(1) with recipient addresses
+# as positional args and the message on stdin.  jmapqueue spools the
+# message to ~/.local/state/jmapsyncd/<account>/spool/pending/ and the
+# daemon submits it over JMAP.  Runs even when the daemon is offline; the
+# daemon drains on next connect.
+outgoing            = jmapqueue
+
+# Trust the DKIM verdict your MTA already stamped; required for aerc's
+# :unsubscribe command (RFC 8058 one-click flow).  Discover the identifier
+# suffix for your provider with:
+#   notmuch search --output=files 'folder:<account>/Inbox' | head -1 |
+#     xargs grep -m1 '^Authentication-Results:'
+# The token between `Authentication-Results:` and the first `;` is your
+# MTA's identifier.  Fastmail is `messagingengine.com`; substitute your
+# provider's suffix here.
+trusted-authres     = messagingengine.com

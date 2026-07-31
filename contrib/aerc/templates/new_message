@@ -1,0 +1,37 @@
+{{- /*
+aerc compose template — zentoo/jmapsyncd send path.
+
+Enabled by:
+  [templates]
+  new-message = new_message
+  [compose]
+  edit-headers = true
+
+The `X-JMAP-Send-At` header below is the scheduling primitive.
+Values accepted:
+  send-now                         → deliver immediately (default; can also
+                                     be omitted entirely with the same effect)
+  ISO8601 timestamp with timezone  → schedule delivery
+    e.g. 2026-08-05T09:00:00Z
+    e.g. 2026-08-05T09:00:00-05:00
+    e.g. 2026-08-05T09:00:00+02:00
+
+`jmapqueue` reads and strips this header before submitting to JMAP.  The
+JMAP server (Fastmail, Stalwart, Cyrus) holds scheduled messages until the
+timestamp.  Sending happens in the same request as filing to Sent
+(EmailSubmission `onSuccessUpdateEmail`) so there's no window where the
+message exists as an unfiled Draft.
+
+Listing / cancelling scheduled sends (works for both immediate and
+scheduled — an in-flight scheduled message can be canceled up to the
+send-at timestamp):
+  jmapsyncd submissions list --state scheduled
+  jmapsyncd submissions cancel <id>
+*/ -}}
+X-Mailer: aerc {{version}}
+X-JMAP-Send-At: send-now
+
+{{ with .Body -}}{{.}}{{- end }}
+{{- with .Signature }}
+
+{{.}}{{- end }}

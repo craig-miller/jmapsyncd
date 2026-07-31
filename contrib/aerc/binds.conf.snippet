@@ -1,0 +1,24 @@
+# jmapsyncd send-path integration for aerc — schedule-send picker binding.
+#
+# `t` in the review screen (after the editor closes) opens an fzf popover
+# with preset send times (`send now`, `in 1 hour`, `tomorrow 9am`, `next
+# monday 9am`, etc.); the picked value replaces X-JMAP-Send-At in the
+# compose header widget via aerc's built-in :header command.
+#
+# NOTE: bind ONLY in [compose::review], not [compose].  In the widget
+# bar, plain-letter binds compete with text entry — typing `t` in the To
+# field would trigger the picker instead of adding a `t` to the address.
+# The review screen is aerc's natural home for single-key ex-commands
+# (y=send, s=sign, p=postpone, etc.).
+#
+# For arbitrary times not in the preset list, Tab to the X-JMAP-Send-At
+# widget and type the ISO8601 timestamp directly.
+#
+# Requires `aerc-schedule-picker` on PATH (installed by the jmapsyncd
+# package as /usr/bin/aerc-schedule-picker, or shipped in contrib/aerc/
+# and copied to ~/.local/bin/ manually for source installs).
+#
+# Merge into your ~/.config/aerc/binds.conf's [compose::review] section.
+
+[compose::review]
+t = :menu -c aerc-schedule-picker :header -f X-JMAP-Send-At<Enter>

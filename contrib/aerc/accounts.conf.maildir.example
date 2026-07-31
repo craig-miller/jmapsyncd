@@ -1,0 +1,34 @@
+# jmapsyncd + direct Maildir backend for aerc (no notmuch dependency).
+#
+# Prerequisites:
+#   - jmapsyncd daemon running and mirroring your JMAP account to
+#     ~/mail/<account>/ (see top-level README).
+#   - jmapqueue installed and on PATH (packaged with jmapsyncd).
+#
+# Search is aerc's built-in (adequate for small stores, slower than notmuch
+# on 100k+ messages).  If you already have notmuch or want fast search
+# later, switch to accounts.conf.notmuch.example — the send-side lines
+# (`outgoing`, `trusted-authres`) don't change.
+#
+# Copy into ~/.config/aerc/accounts.conf and adjust the personal details.
+
+[personal]
+source              = maildir://~/mail/personal
+default             = INBOX
+
+from                = Your Name <you@example.com>
+copy-to             = Sent
+postpone            = Drafts
+archive             = Archive
+
+# Send path — aerc invokes this like sendmail(1) with recipient addresses
+# as positional args and the message on stdin.  jmapqueue spools the
+# message and the daemon submits it over JMAP.
+outgoing            = jmapqueue
+
+# Trust the DKIM verdict your MTA already stamped; required for aerc's
+# :unsubscribe command.  Substitute your JMAP provider's MTA identifier
+# suffix; discover it by opening any inbox message in aerc and looking at
+# the Authentication-Results header, or with grep against the raw file.
+# Fastmail is `messagingengine.com`.
+trusted-authres     = messagingengine.com
