@@ -86,7 +86,7 @@ impl ConfigFile {
 // Account — one JMAP account in the config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Account {
     pub name: String,
     #[serde(default = "helpers::default_true")]
@@ -103,7 +103,7 @@ pub struct Account {
     pub submit: Option<SubmitConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum TokenSource {
     Inline {
@@ -122,7 +122,7 @@ pub enum TokenSource {
 // MailConfig — per-account maildir + JMAP mail settings
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct MailConfig {
     #[serde(deserialize_with = "helpers::expand_path")]
@@ -158,7 +158,7 @@ pub struct MailConfig {
 // Leaf config types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default, deserialize_with = "helpers::expand_opt_path")]
@@ -170,7 +170,7 @@ pub struct TlsConfig {
     pub fingerprint: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BoxMapping {
     pub remote: String,
     pub local: String,
@@ -182,7 +182,7 @@ pub struct BoxMapping {
 // account's MailConfig (see Config::load).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitConfig {
     /// Author address stamped on outbound mail. jmapqueue also uses this
@@ -237,7 +237,7 @@ impl<'de> serde::Deserialize<'de> for ScheduledFolder {
     }
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncMode {
     #[default]

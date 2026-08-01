@@ -1,6 +1,8 @@
 use crate::config::Account;
 use crate::db::Database;
 use crate::sync;
+
+mod submit;
 use futures_util::StreamExt;
 use jmap_client::DataType;
 use jmap_client::client::Client;
@@ -336,6 +338,21 @@ async fn run_daemon_inner(config: Config) -> anyhow::Result<()> {
                 continue;
             }
         };
+
+        // Send-path Phase D: if the account has [accounts.submit], spawn
+        // a second per-account task that watches Outbox/ + Failed/ and
+        // (in this phase) logs what it would submit. Phase E replaces
+        // the log-only body with the real EmailSubmission chain.
+        if acct.submit.is_some() {
+            let submit_cancel = cancel.child_token();
+            let submit_acct = acct.clone();
+            let submit_name = acct.name.clone();
+            let submit_handle = spawn_local(async move {
+                submit::run_account_submit_loop(submit_acct, submit_cancel).await;
+                log::info!("[{submit_name}/submit] task exited");
+            });
+            handles.push(submit_handle);
+        }
 
         let task_cancel = cancel.child_token();
         let acct_name = acct.name.clone();
