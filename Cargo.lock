@@ -1125,7 +1125,7 @@ dependencies = [
 [[package]]
 name = "jmap-client"
 version = "0.4.2"
-source = "git+https://github.com/craig-miller/jmap-client.git?branch=zentoo#bf59494382796df2aa8ce5e76e077c15627f7ceb"
+source = "git+https://github.com/craig-miller/jmap-client.git?branch=zentoo#571c495c3df1151f3075d8ee4e4082b1d5879b73"
 dependencies = [
  "ahash",
  "async-stream",

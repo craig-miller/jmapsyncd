@@ -11,6 +11,7 @@ use log::{debug, error, info, warn};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::time::Duration;
+use std::sync::Arc;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
@@ -30,7 +31,7 @@ const MAILDIR_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Multi-account supervision is C.3's concern; each account gets its own
 /// tokio::task holding its own Client + Database + cancel-child token.
 pub async fn run_account_sse_loop(
-    client: Client,
+    client: Arc<Client>,
     acct: Account,
     db: Database,
     cancel: CancellationToken,
@@ -329,7 +330,7 @@ async fn run_daemon_inner(config: Config) -> anyhow::Result<()> {
         };
 
         let client = match crate::jmap::client_from_account(&acct).await {
-            Ok(c) => c,
+            Ok(c) => Arc::new(c),
             Err(e) => {
                 log::error!(
                     "[{}] failed to authenticate JMAP client: {e:#}; skipping account",
@@ -339,16 +340,18 @@ async fn run_daemon_inner(config: Config) -> anyhow::Result<()> {
             }
         };
 
-        // Send-path Phase D: if the account has [accounts.submit], spawn
+        // Send-path Phase E: if the account has [accounts.submit], spawn
         // a second per-account task that watches Outbox/ + Failed/ and
-        // (in this phase) logs what it would submit. Phase E replaces
-        // the log-only body with the real EmailSubmission chain.
+        // drives the real JMAP submission chain. Both tasks share the
+        // same Arc<Client> — same auth session, same connection pool,
+        // single pinentry prompt on startup.
         if acct.submit.is_some() {
             let submit_cancel = cancel.child_token();
             let submit_acct = acct.clone();
+            let submit_client = Arc::clone(&client);
             let submit_name = acct.name.clone();
             let submit_handle = spawn_local(async move {
-                submit::run_account_submit_loop(submit_acct, submit_cancel).await;
+                submit::run_account_submit_loop(submit_client, submit_acct, submit_cancel).await;
                 log::info!("[{submit_name}/submit] task exited");
             });
             handles.push(submit_handle);

@@ -1,174 +1,248 @@
-//! Per-account Outbox watcher — send-path Phase D.
+//! Per-account Outbox watcher — send-path Phase E (real submission).
 //!
 //! Runs alongside the SSE sync loop for any account with an
 //! `[accounts.submit]` block. Watches the account's `Outbox/` and
-//! `Failed/` Maildirs, enumerates queued messages, and — in this
-//! phase — logs what it would do. Phase E replaces the logging with
-//! the actual JMAP `EmailSubmission` chain plus header-injection on
-//! permanent failures.
+//! `Failed/` Maildirs, enumerates queued messages, and drives them
+//! through the JMAP submission chain (Blob/upload + Email/import +
+//! EmailSubmission/set with onSuccessUpdateEmail).
 //!
 //! Design notes:
 //!
-//! - Files in `Outbox/tmp/` are intentionally ignored (mid-write).
-//!   jmapqueue's atomic-rename lands the final file in `Outbox/new/`,
-//!   which is what we act on. MUAs that display the file may then
-//!   move it to `Outbox/cur/` with a `:2,` flag suffix; we watch
-//!   both new/ and cur/ and treat basenames as the identity.
+//! - **Good-citizen posture.** All requests to the JMAP server are
+//!   serial per account (no in-flight parallelism). Failures back off
+//!   exponentially with jitter and NEVER retry-storm. Permanent
+//!   failures (4xx-class) move once to `Failed/` and are never
+//!   re-attempted without user action (drag-back).
 //!
-//! - Sidecar meta lives at
-//!   `~/.local/state/jmapsyncd/<account>/outbox-meta/<basename>.json`.
-//!   The basename in the sidecar name is the filename *without* any
-//!   `:2,` flags suffix (jmapqueue only writes to `new/`, so the
-//!   sidecar name always matches the raw filename at creation).
+//! - **Startup context resolution.** `SubmitContext::resolve` runs one
+//!   Identity/get + one Mailbox/get on daemon startup, caches the
+//!   identity_id / drafts_id / sent_id / scheduled folder id.
+//!   Never refreshed while the loop is up — a full daemon restart is
+//!   the recovery path if the server-side identity changes.
 //!
-//! - Drag-back detection: any base-filename that appeared in `Failed/`
-//!   at some point during this loop's lifetime is tracked in
-//!   `known_failures`. When that same base-filename shows up in
-//!   `Outbox/{new,cur}`, we log a drag-back intent (Phase E will
-//!   strip the injected `X-JMAP-*` headers + reset backoff meta).
+//! - **Retry schedule.** `RetrySchedule` is an in-memory BTreeMap keyed
+//!   by due `Instant`, with a basename-index for cheap rescheduling.
+//!   `wait_next()` returns a future that resolves at the earliest due
+//!   time, or stays pending forever when the schedule is empty.
 //!
-//!   Known limitation for Phase D: on a `mv Failed/x Outbox/x`,
-//!   notify emits two events (Failed-side rename-from, then
-//!   Outbox-side rename-to). We currently process them in order,
-//!   which removes `x` from `known_failures` on the rename-from
-//!   before the rename-to can trigger the drag-back branch — so
-//!   the log shows `unlinked (user cleanup)` + `queued` instead
-//!   of `drag-back`. Log-only Phase D tolerates this because the
-//!   eventual side effect (would-submit) is the same. Phase E's
-//!   real drag-back handler needs to strip `X-JMAP-*` headers
-//!   atomically, so it will pair rename-from + rename-to events
-//!   via a short-lived pending-rename cache indexed by basename.
+//! - **Sidecar `in_flight` field.** Set at the moment of the first
+//!   request (`Blob/upload`) and cleared on any terminal outcome.
+//!   Startup scan surfaces any lingering `in_flight` sidecar older
+//!   than STARTUP_INFLIGHT_STALENESS as a LOUD warning: the daemon
+//!   crashed mid-submit, and we can't tell whether the server saw
+//!   the request. We retry (may duplicate) — losing mail is worse
+//!   than the small window of duplicate-on-crash.
+//!
+//! - **Drag-back rename pairing.** A `Failed → Outbox` move fires
+//!   two inotify events: rename-from (Failed side) then rename-to
+//!   (Outbox side), a few ms apart. We keep a short-lived
+//!   `HashMap<basename, PendingRename>` cache with a
+//!   RENAME_PAIR_WINDOW timeout. If the pair completes, we treat
+//!   it as a single drag-back: strip Family-2 diagnostic headers
+//!   from the file atomically (tmp+rename) and re-enqueue.
+//!
+//! - **Family-2 headers** (`X-JMAP-Failure`, `X-JMAP-Failed-At`,
+//!   `X-JMAP-Ulid`): injected only on a permanent-failure move to
+//!   Failed/, stripped on drag-back. Never visible on the wire.
 
-use crate::config::Account;
-use anyhow::{Context, Result};
-use log::{debug, info, warn};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::CreateKind};
-use serde::Deserialize;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::task::spawn_local;
+use crate::config::{Account, ScheduledFolder, SubmitConfig};
+use crate::jmap::restrict_using;
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, SecondsFormat, Utc};
+use jmap_client::{
+    client::Client,
+    core::{
+        error::{MethodError, MethodErrorType},
+        response::{IdentityGetResponse, MailboxGetResponse, MethodResponse},
+        set::SetObject,
+    },
+    mailbox::Role,
+    Error as JmapError,
+};
+use log::{debug, error, info, warn};
+use notify::{
+    event::{ModifyKind, RenameMode},
+    EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::{sync::mpsc, task::spawn_local};
 use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
 
-/// Debounce window for coalescing rapid inotify events on the same
-/// file (typical case: aerc moves `new/foo` → `cur/foo:2,` right after
-/// jmapqueue writes it; two events land within milliseconds).
+// ---------------------------------------------------------------------------
+// Tuning constants
+// ---------------------------------------------------------------------------
+
+/// Debounce window for coalescing rapid same-file inotify events.
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(100);
 
-/// Log-only per-account outbox watcher. Long-running; returns when
-/// `cancel` fires. Bring-up failures (missing mail block, watch setup
-/// error) are logged and returned as `Ok(())` — one broken account
-/// shouldn't tear down the daemon.
-pub async fn run_account_submit_loop(acct: Account, cancel: CancellationToken) {
-    if acct.submit.is_none() {
-        debug!(
-            "[{}] no [accounts.submit] block; submit loop not spawned",
-            acct.name
-        );
-        return;
-    }
-    let Some(mail_cfg) = acct.mail.as_ref() else {
-        warn!(
-            "[{}] [accounts.submit] present but no [accounts.mail]; submit loop cannot start",
-            acct.name
-        );
-        return;
-    };
+/// How long a `RenameFrom` event waits for its paired `RenameTo`
+/// before we give up and treat the from-event as a plain remove.
+/// 500ms is generous — the two events usually arrive within a few ms.
+const RENAME_PAIR_WINDOW: Duration = Duration::from_millis(500);
+
+/// Sidecars with `in_flight` older than this at startup produce a loud
+/// warning about a possible mid-submit crash.
+const STARTUP_INFLIGHT_STALENESS: Duration = Duration::from_secs(60);
+
+/// Jitter amplitude on backoff — ±20% of the computed delay. Guards
+/// against thundering-herd when several messages retry simultaneously
+/// after a network recovery.
+const BACKOFF_JITTER: f64 = 0.20;
+
+/// Cap on how many attempts we double for. 2^30 seconds is ~34 years;
+/// this is only about u64 overflow safety, not a real cap on retries.
+const BACKOFF_ATTEMPT_CAP: u32 = 30;
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Per-account outbox watcher. Long-running; returns when `cancel` fires.
+/// A bring-up failure (no identity match, no drafts folder, watcher setup
+/// error) is logged and the loop returns — one broken account should not
+/// tear the daemon down.
+pub async fn run_account_submit_loop(
+    client: Arc<Client>,
+    acct: Account,
+    cancel: CancellationToken,
+) {
     let acct_name = acct.name.clone();
+    if let Err(e) = run_account_submit_loop_inner(client, acct, cancel).await {
+        error!("[{acct_name}/submit] loop terminated: {e:#}");
+    }
+}
+
+async fn run_account_submit_loop_inner(
+    client: Arc<Client>,
+    acct: Account,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let acct_name = acct.name.clone();
+
+    let Some(submit_cfg) = acct.submit.as_ref() else {
+        debug!("[{acct_name}] no [accounts.submit] block; submit loop not spawned");
+        return Ok(());
+    };
+    let Some(mail_cfg) = acct.mail.as_ref() else {
+        warn!("[{acct_name}] [accounts.submit] present but no [accounts.mail]; skip");
+        return Ok(());
+    };
+
     let mail_root = mail_cfg.path.clone();
     let outbox = mail_root.join("Outbox");
     let failed = mail_root.join("Failed");
 
-    // Ensure both dirs exist so the watcher subscription succeeds. Same
-    // maildir layout jmapqueue creates on demand (tmp/new/cur under each).
+    // Ensure both Maildirs exist so the watch subscription can attach.
     for base in [&outbox, &failed] {
         for sub in ["tmp", "new", "cur"] {
-            if let Err(e) = std::fs::create_dir_all(base.join(sub)) {
-                warn!(
-                    "[{acct_name}] cannot create {}: {e}; submit loop cannot start",
-                    base.join(sub).display()
-                );
-                return;
-            }
+            std::fs::create_dir_all(base.join(sub))
+                .with_context(|| format!("create {}", base.join(sub).display()))?;
         }
     }
 
-    let sidecar_dir = match sidecar_dir_for(&acct_name) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("[{acct_name}] no XDG state dir: {e:#}; submit loop cannot start");
-            return;
-        }
-    };
-    if let Err(e) = std::fs::create_dir_all(&sidecar_dir) {
-        warn!(
-            "[{acct_name}] cannot create sidecar dir {}: {e}; submit loop cannot start",
-            sidecar_dir.display()
-        );
-        return;
-    }
+    let sidecar_dir = sidecar_dir_for(&acct_name)?;
+    std::fs::create_dir_all(&sidecar_dir)
+        .with_context(|| format!("create {}", sidecar_dir.display()))?;
 
-    // Seed the known-failures set from disk so drag-back detection
-    // survives daemon restarts.
-    let mut known_failures: HashSet<String> = scan_basenames(&failed);
+    // Resolve identity + mailbox ids up-front. Fail-fast if the config
+    // doesn't match anything on the server — better to know at startup
+    // than at first submit.
+    let ctx = SubmitContext::resolve(&client, submit_cfg).await
+        .with_context(|| format!("[{acct_name}] resolve submit context"))?;
     info!(
-        "[{acct_name}/submit] known failures at startup: {}",
-        known_failures.len()
+        "[{acct_name}/submit] context: identity={} drafts={} sent={} scheduled={}",
+        ctx.identity_id,
+        ctx.drafts_id,
+        ctx.sent_id,
+        ctx.scheduled_file_target_id
+            .as_ref()
+            .map(String::as_str)
+            .unwrap_or("<falls-back-to-sent>"),
     );
 
-    // Startup scan of Outbox — anything queued while the daemon was
-    // down, plus any real drag-backs that happened offline.
+    // Loudly warn on any in-flight sidecars — we crashed mid-submit
+    // previously. Then treat them as pending (may duplicate on server).
+    warn_on_stale_inflight(&sidecar_dir, &acct_name);
+
+    // Seed known-failures from disk so drag-back detection survives
+    // daemon restarts.
+    let mut known_failures = scan_basenames(&failed);
+    info!("[{acct_name}/submit] known failures at startup: {}", known_failures.len());
+
+    // Startup scan: schedule every Outbox file at its sidecar's
+    // recorded next_at (or immediately if none).
+    let mut retry_queue = RetrySchedule::new();
+    let mut pending_renames: HashMap<String, PendingRename> = HashMap::new();
+    let now_epoch_secs = epoch_secs_now();
     for path in scan_maildir_files(&outbox) {
         let basename = strip_flags(&filename_of(&path));
-        let intent = load_intent(&sidecar_dir, &basename);
-        if known_failures.contains(&basename) {
-            info!(
-                "[{acct_name}/submit] startup drag-back: {basename} (would strip X-JMAP-* headers + resubmit) — {intent}"
-            );
-            known_failures.remove(&basename);
-        } else {
-            info!("[{acct_name}/submit] startup pending: {basename} — {intent}");
-        }
+        let sidecar = SidecarState::load(&sidecar_dir, &basename);
+        let due_secs = sidecar
+            .retry
+            .as_ref()
+            .and_then(|r| r.next_at_epoch_secs())
+            .unwrap_or(now_epoch_secs);
+        let delay = Duration::from_secs(due_secs.saturating_sub(now_epoch_secs));
+        retry_queue.schedule(basename.clone(), Instant::now() + delay);
+        info!(
+            "[{acct_name}/submit] startup enqueue: {basename} in {}s — {}",
+            delay.as_secs(),
+            sidecar.format_log(),
+        );
     }
 
-    // Watcher — separate raw event stream per side so we can classify
-    // by directory in the debounce loop.
-    let watcher_rx = match spawn_outbox_watch(&outbox, &failed, EVENT_DEBOUNCE, cancel.clone()) {
-        Ok(rx) => rx,
-        Err(e) => {
-            warn!(
-                "[{acct_name}] outbox watch setup failed: {e:#}; submit loop cannot start"
-            );
-            return;
-        }
-    };
+    // Watcher — separate raw event stream, debounced.
+    let watcher_rx = spawn_outbox_watch(&outbox, &failed, EVENT_DEBOUNCE, cancel.clone())
+        .with_context(|| format!("[{acct_name}] outbox watch setup"))?;
     let mut rx = watcher_rx.rx;
     let _watcher_keep_alive = watcher_rx._watcher;
 
     info!(
-        "[{acct_name}/submit] watching {} + {} (log-only in Phase D)",
+        "[{acct_name}/submit] watching {} + {}",
         outbox.display(),
         failed.display()
     );
 
     loop {
+        // Sweep any timed-out pending-rename entries so they don't
+        // linger past the pair window (they degrade to plain removes).
+        expire_pending_renames(&mut pending_renames, &mut known_failures, &acct_name);
+
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
-                info!("[{acct_name}/submit] cancel received; loop exiting");
-                return;
+                info!("[{acct_name}/submit] cancel; loop exiting");
+                return Ok(());
+            }
+            _ = retry_queue.wait_next() => {
+                for basename in retry_queue.drain_due() {
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    handle_submit_attempt(
+                        &client, &ctx, submit_cfg,
+                        &sidecar_dir, &outbox, &failed,
+                        &basename, &mut retry_queue,
+                        &acct_name,
+                    ).await;
+                }
             }
             maybe_ev = rx.recv() => {
                 let Some(ev) = maybe_ev else {
                     info!("[{acct_name}/submit] watcher channel closed; loop exiting");
-                    return;
+                    return Ok(());
                 };
                 handle_event(
-                    &acct_name,
-                    &outbox,
-                    &failed,
-                    &sidecar_dir,
-                    &mut known_failures,
+                    &acct_name, &outbox, &sidecar_dir,
+                    &mut known_failures, &mut pending_renames, &mut retry_queue,
                     ev,
                 );
             }
@@ -177,15 +251,539 @@ pub async fn run_account_submit_loop(acct: Account, cancel: CancellationToken) {
 }
 
 // ---------------------------------------------------------------------------
-// Event handling
+// SubmitContext — cached identity + mailbox IDs
 // ---------------------------------------------------------------------------
+
+struct SubmitContext {
+    account_id: String,
+    identity_id: String,
+    drafts_id: String,
+    sent_id: String,
+    /// When scheduled sends should land in a folder OTHER than Sent
+    /// on submission success, this is that folder's id. `None` means
+    /// "use sent_id for scheduled sends too" (portable fallback).
+    scheduled_file_target_id: Option<String>,
+}
+
+impl SubmitContext {
+    async fn resolve(client: &Client, submit_cfg: &SubmitConfig) -> Result<Self> {
+        let account_id = client.default_account_id().to_string();
+
+        // ---- Identity ------------------------------------------------
+        let identity_id = if let Some(id) = &submit_cfg.identity_id {
+            id.clone()
+        } else {
+            let mut req = client.build();
+            restrict_using(&mut req);
+            req.get_identity();
+            let mut resp: IdentityGetResponse = req.send_single().await
+                .context("Identity/get")?;
+            let identities = resp.take_list();
+            identities
+                .into_iter()
+                .find(|i| {
+                    i.email()
+                        .map(|e| e.eq_ignore_ascii_case(&submit_cfg.from_address))
+                        .unwrap_or(false)
+                })
+                .and_then(|i| i.id().map(String::from))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no JMAP Identity matches from_address {:?} — check `pass show` \
+                         picks up the right account, and that the identity exists in \
+                         Fastmail's Settings → Sending identities",
+                        submit_cfg.from_address,
+                    )
+                })?
+        };
+
+        // ---- Mailboxes: drafts, sent, and (optionally) Scheduled -----
+        let mut req = client.build();
+        restrict_using(&mut req);
+        req.get_mailbox();
+        let mut resp: MailboxGetResponse = req.send_single().await
+            .context("Mailbox/get")?;
+        let mailboxes = resp.take_list();
+
+        let drafts_id = mailboxes
+            .iter()
+            .find(|m| matches!(m.role(), Role::Drafts))
+            .and_then(|m| m.id().map(String::from))
+            .ok_or_else(|| {
+                anyhow!("no Drafts mailbox (role=drafts) on the account — send path cannot start")
+            })?;
+        let sent_id = mailboxes
+            .iter()
+            .find(|m| matches!(m.role(), Role::Sent))
+            .and_then(|m| m.id().map(String::from))
+            .ok_or_else(|| {
+                anyhow!("no Sent mailbox (role=sent) on the account — send path cannot start")
+            })?;
+
+        let scheduled_file_target_id = match &submit_cfg.scheduled_folder {
+            ScheduledFolder::Sent => None,
+            ScheduledFolder::Auto => find_mailbox_id_by_name(&mailboxes, "Scheduled"),
+            ScheduledFolder::Named(name) => {
+                let found = find_mailbox_id_by_name(&mailboxes, name);
+                if found.is_none() {
+                    warn!(
+                        "scheduled_folder = {name:?} but no such mailbox found; \
+                         scheduled sends will fall back to Sent"
+                    );
+                }
+                found
+            }
+        };
+
+        Ok(Self {
+            account_id,
+            identity_id,
+            drafts_id,
+            sent_id,
+            scheduled_file_target_id,
+        })
+    }
+
+    /// Mailbox id the message should file into on submission success.
+    fn file_target_id(&self, has_send_at: bool) -> &str {
+        if has_send_at {
+            self.scheduled_file_target_id.as_deref().unwrap_or(&self.sent_id)
+        } else {
+            &self.sent_id
+        }
+    }
+}
+
+fn find_mailbox_id_by_name(
+    mailboxes: &[jmap_client::mailbox::Mailbox<jmap_client::Get>],
+    target: &str,
+) -> Option<String> {
+    mailboxes
+        .iter()
+        .find(|m| m.name().map(|n| n.eq_ignore_ascii_case(target)).unwrap_or(false))
+        .and_then(|m| m.id().map(String::from))
+}
+
+// ---------------------------------------------------------------------------
+// RetrySchedule — in-memory backoff queue
+// ---------------------------------------------------------------------------
+
+struct RetrySchedule {
+    schedule: BTreeMap<Instant, HashSet<String>>,
+    index: HashMap<String, Instant>,
+}
+
+impl RetrySchedule {
+    fn new() -> Self {
+        Self {
+            schedule: BTreeMap::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    /// Schedule (or reschedule) `basename` for the given instant.
+    /// A previously-scheduled entry is moved cleanly.
+    fn schedule(&mut self, basename: String, when: Instant) {
+        self.remove(&basename);
+        self.schedule
+            .entry(when)
+            .or_insert_with(HashSet::new)
+            .insert(basename.clone());
+        self.index.insert(basename, when);
+    }
+
+    fn remove(&mut self, basename: &str) {
+        if let Some(prev) = self.index.remove(basename) {
+            if let Some(set) = self.schedule.get_mut(&prev) {
+                set.remove(basename);
+                if set.is_empty() {
+                    self.schedule.remove(&prev);
+                }
+            }
+        }
+    }
+
+    /// Pop all entries whose due-time is at or before now.
+    fn drain_due(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        while let Some((&when, _)) = self.schedule.iter().next() {
+            if when > now {
+                break;
+            }
+            let set = self.schedule.remove(&when).unwrap_or_default();
+            for name in &set {
+                self.index.remove(name);
+            }
+            due.extend(set);
+        }
+        due
+    }
+
+    /// Future that resolves at the earliest due-time. When the schedule
+    /// is empty, stays pending forever (select! arm becomes inert).
+    async fn wait_next(&self) {
+        match self.schedule.iter().next() {
+            Some((&when, _)) => {
+                let now = Instant::now();
+                if when <= now {
+                    return;
+                }
+                tokio::time::sleep_until(tokio::time::Instant::from_std(when)).await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Backoff schedule: base * 2^(attempts-1), capped, jittered.
+/// `attempts` is the count AFTER this failure (so the first retry
+/// gets `base_secs`; second gets `base_secs * 2`; etc).
+fn backoff_delay(attempts: u32, base_secs: u64, cap_secs: u64) -> Duration {
+    let exp = attempts.saturating_sub(1).min(BACKOFF_ATTEMPT_CAP);
+    let raw = base_secs.saturating_mul(1u64.checked_shl(exp).unwrap_or(u64::MAX));
+    let raw = raw.min(cap_secs).max(1);
+    let jitter = raw as f64 * BACKOFF_JITTER * jitter_fraction();
+    let jittered = (raw as f64 + jitter).max(1.0);
+    Duration::from_secs_f64(jittered)
+}
+
+/// Cheap pseudo-random -1..=1 from the current wall clock. We don't
+/// need cryptographic quality; we want to break up simultaneous retries.
+fn jitter_fraction() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos as f64 / 1_000_000_000.0) * 2.0 - 1.0
+}
+
+// ---------------------------------------------------------------------------
+// Submit outcome + error classification
+// ---------------------------------------------------------------------------
+
+enum SubmitOutcome {
+    /// All method calls succeeded; entry is done.
+    Success,
+    /// Retry with backoff. String is the human-readable reason.
+    Transient(String),
+    /// Move to Failed. String becomes the `X-JMAP-Failure` header value.
+    Permanent(String),
+}
+
+impl SubmitOutcome {
+    fn from_jmap_error(e: JmapError) -> Self {
+        match e {
+            // Any network / TLS / body-read error: retry with backoff.
+            JmapError::Transport(err) => {
+                let msg = format!("transport: {err}");
+                if let Some(status) = err.status() {
+                    if status.is_client_error() && status.as_u16() != 429 {
+                        return SubmitOutcome::Permanent(format!("http {}: {err}", status.as_u16()));
+                    }
+                }
+                SubmitOutcome::Transient(msg)
+            }
+            // ProblemDetails is a JMAP-level HTTP error object.
+            // Only status >= 500 or 429 count as transient; 4xx else is permanent.
+            JmapError::Problem(pd) => {
+                let status = pd.status().unwrap_or(0);
+                let msg = format!(
+                    "problem status={} title={:?}",
+                    status,
+                    pd.title().unwrap_or("")
+                );
+                if status >= 500 || status == 429 || status == 408 {
+                    SubmitOutcome::Transient(msg)
+                } else {
+                    SubmitOutcome::Permanent(msg)
+                }
+            }
+            JmapError::Server(msg) => {
+                // Ambiguous — the server said something the crate couldn't
+                // parse. Treat as transient (safer than moving to Failed
+                // on a parse fluke) but log loud.
+                warn!("jmap-client Error::Server (ambiguous, treating as transient): {msg}");
+                SubmitOutcome::Transient(format!("server: {msg}"))
+            }
+            JmapError::Method(me) => Self::from_method_error(&me),
+            JmapError::Set(se) => {
+                // Not expected at request level — SetError normally arrives
+                // inside SetResponse.not_created. Treat as permanent since
+                // it's specific enough to say something is wrong with the
+                // record.
+                SubmitOutcome::Permanent(format!("set: {se:?}"))
+            }
+            JmapError::Parse(err) => {
+                warn!("jmap-client Error::Parse (treating as transient): {err}");
+                SubmitOutcome::Transient(format!("parse: {err}"))
+            }
+            JmapError::Internal(msg) => {
+                warn!("jmap-client Error::Internal (treating as transient): {msg}");
+                SubmitOutcome::Transient(format!("internal: {msg}"))
+            }
+            JmapError::WebSocket(err) => {
+                // Not our transport (we use HTTP) but jmap-client's
+                // default-features build compiles the enum variant
+                // unconditionally. Treat as transient — a WebSocket
+                // error is always a connection issue, never a
+                // per-message reject.
+                warn!("jmap-client Error::WebSocket (treating as transient): {err}");
+                SubmitOutcome::Transient(format!("websocket: {err}"))
+            }
+        }
+    }
+
+    fn from_method_error(me: &MethodError) -> Self {
+        use MethodErrorType as T;
+        match me.error() {
+            // Server-side hiccups: retry.
+            T::ServerUnavailable | T::ServerFail | T::ServerPartialFail => {
+                SubmitOutcome::Transient(format!("method {}", me))
+            }
+            // Anything else at method level is a client-error: our
+            // request is malformed / not allowed / not found. Permanent.
+            _ => SubmitOutcome::Permanent(format!("method {}", me)),
+        }
+    }
+
+}
+
+
+// ---------------------------------------------------------------------------
+// submit_one + outcome dispatch
+// ---------------------------------------------------------------------------
+
+async fn handle_submit_attempt(
+    client: &Client,
+    ctx: &SubmitContext,
+    submit_cfg: &SubmitConfig,
+    sidecar_dir: &Path,
+    outbox: &Path,
+    failed: &Path,
+    basename: &str,
+    retry_queue: &mut RetrySchedule,
+    acct_name: &str,
+) {
+    let (msg_path, msg_bytes) = match locate_and_read_outbox_message(outbox, basename) {
+        Ok(x) => x,
+        Err(_) => {
+            debug!("[{acct_name}/submit] {basename}: file vanished; dropping from queue");
+            let _ = std::fs::remove_file(sidecar_dir.join(format!("{basename}.json")));
+            return;
+        }
+    };
+    let mut sidecar = SidecarState::load(sidecar_dir, basename);
+
+    // Mark in_flight for crash-recovery accounting; save before the network I/O.
+    sidecar.in_flight = Some(iso_now());
+    if let Err(e) = sidecar.save(sidecar_dir, basename) {
+        warn!("[{acct_name}/submit] {basename}: sidecar in_flight save: {e:#}");
+    }
+
+    let outcome = submit_one(client, ctx, &msg_bytes, &sidecar).await;
+
+    match outcome {
+        SubmitOutcome::Success => {
+            info!("[{acct_name}/submit] {basename}: submitted");
+            let _ = std::fs::remove_file(&msg_path);
+            let _ = std::fs::remove_file(sidecar_dir.join(format!("{basename}.json")));
+        }
+        SubmitOutcome::Transient(reason) => {
+            let attempts = sidecar
+                .retry
+                .as_ref()
+                .map(|r| r.attempts.saturating_add(1))
+                .unwrap_or(1);
+            let delay = backoff_delay(attempts, submit_cfg.retry_base_secs, submit_cfg.retry_cap_secs);
+            let due_at_secs = epoch_secs_now().saturating_add(delay.as_secs());
+            sidecar.in_flight = None;
+            sidecar.retry = Some(RetryState {
+                attempts,
+                next_at: Some(iso_from_epoch_secs(due_at_secs)),
+                last_error: Some(reason.clone()),
+            });
+            if let Err(e) = sidecar.save(sidecar_dir, basename) {
+                warn!("[{acct_name}/submit] {basename}: sidecar backoff save: {e:#}");
+            }
+            warn!(
+                "[{acct_name}/submit] {basename}: transient (attempt={attempts}, next in {}s) — {reason}",
+                delay.as_secs()
+            );
+            retry_queue.schedule(basename.to_string(), Instant::now() + delay);
+        }
+        SubmitOutcome::Permanent(reason) => {
+            error!("[{acct_name}/submit] {basename}: permanent — {reason}");
+            let ulid = Ulid::new().to_string();
+            match move_to_failed_atomic(&msg_path, failed, basename, &reason, &ulid) {
+                Ok(final_path) => {
+                    info!(
+                        "[{acct_name}/submit] {basename}: moved to {}",
+                        final_path.display()
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "[{acct_name}/submit] {basename}: mv-to-Failed failed: {e:#}. \
+                         Leaving file in Outbox but disabling retry to avoid a spam loop. \
+                         Investigate and delete manually."
+                    );
+                }
+            }
+            let _ = std::fs::remove_file(sidecar_dir.join(format!("{basename}.json")));
+        }
+    }
+}
+
+async fn submit_one(
+    client: &Client,
+    ctx: &SubmitContext,
+    msg_bytes: &[u8],
+    sidecar: &SidecarState,
+) -> SubmitOutcome {
+    // ---- Parse send_at if present -----------------------------------
+    let send_at_dt = match sidecar.send_at.as_deref() {
+        None => None,
+        Some(s) => match DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => Some(dt.with_timezone(&Utc)),
+            Err(e) => {
+                return SubmitOutcome::Permanent(format!(
+                    "sidecar send_at {s:?} not a valid RFC3339 timestamp: {e}"
+                ));
+            }
+        },
+    };
+
+    // ---- Blob upload -------------------------------------------------
+    let upload = match client
+        .upload(Some(&ctx.account_id), msg_bytes.to_vec(), Some("message/rfc822"))
+        .await
+    {
+        Ok(u) => u,
+        Err(e) => return SubmitOutcome::from_jmap_error(e),
+    };
+    let blob_id = upload.blob_id().to_string();
+    debug!("uploaded blob {blob_id}");
+
+    // ---- Chained Email/import + EmailSubmission/set ------------------
+    let mut req = client.build();
+    restrict_using(&mut req);
+
+    // Email/import: place in Drafts with $draft keyword.
+    let email_create_id = {
+        let import = req.import_email().account_id(&ctx.account_id).email(&blob_id);
+        import.mailbox_ids([&ctx.drafts_id]);
+        import.keywords(["$draft"]);
+        import.create_id()
+    };
+
+    // EmailSubmission/set: reference the just-imported email by
+    // creation-id (`#i0`); set identity + envelope + optional sendAt.
+    let submission_create_id = {
+        let set_req = req.set_email_submission();
+        let create = set_req.create();
+        create.email_id(format!("#{}", email_create_id));
+        create.identity_id(&ctx.identity_id);
+        create.envelope(
+            sidecar.envelope.from.as_str(),
+            sidecar
+                .envelope
+                .to
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+        );
+        if let Some(dt) = send_at_dt {
+            create.send_at(dt);
+        }
+        create.create_id().unwrap_or_else(|| "c0".to_string())
+    };
+
+    // onSuccessUpdateEmail: file into Sent (or Scheduled folder),
+    // clear the Drafts placement, drop $draft, add $seen.
+    let file_target = ctx.file_target_id(send_at_dt.is_some()).to_string();
+    {
+        let set_req = req.set_email_submission();
+        let args = set_req.arguments();
+        let update = args.on_success_update_email(&submission_create_id);
+        update.mailbox_id(&ctx.drafts_id, false);
+        update.mailbox_id(&file_target, true);
+        update.keyword("$draft", false);
+        update.keyword("$seen", true);
+    }
+
+    // ---- Send + interpret -------------------------------------------
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return SubmitOutcome::from_jmap_error(e),
+    };
+
+    for tagged in resp.unwrap_method_responses() {
+        match tagged.unwrap_method_response() {
+            MethodResponse::Error(me) => return SubmitOutcome::from_method_error(&me),
+            MethodResponse::ImportEmail(mut import_resp) => {
+                // EmailImportResponse doesn't expose the same helpers as
+                // SetResponse, so we drive it via its two id accessors.
+                // `.created(id)` returns the SetError as an Err when the
+                // id is in the not_created bucket.
+                let not_created: Vec<String> = import_resp
+                    .not_created_ids()
+                    .map(|it| it.cloned().collect())
+                    .unwrap_or_default();
+                if let Some(first) = not_created.first().cloned() {
+                    return match import_resp.created(&first) {
+                        Err(e) => SubmitOutcome::Permanent(format!("Email/import: {e}")),
+                        Ok(_) => SubmitOutcome::Permanent(format!(
+                            "Email/import not_created: {not_created:?}"
+                        )),
+                    };
+                }
+                let created: Vec<String> = import_resp
+                    .created_ids()
+                    .map(|it| it.cloned().collect())
+                    .unwrap_or_default();
+                if created.is_empty() {
+                    return SubmitOutcome::Permanent(
+                        "Email/import returned no created entry".into(),
+                    );
+                }
+            }
+            MethodResponse::SetEmailSubmission(set_resp) => {
+                if let Err(e) = set_resp.unwrap_create_errors() {
+                    return SubmitOutcome::Permanent(format!("EmailSubmission/set: {e}"));
+                }
+                if !set_resp.has_created() {
+                    return SubmitOutcome::Permanent(
+                        "EmailSubmission/set returned no created entry".into(),
+                    );
+                }
+            }
+            // Other method responses in the chain aren't errors.
+            _ => {}
+        }
+    }
+
+    SubmitOutcome::Success
+}
+
+// ---------------------------------------------------------------------------
+// Event handling + drag-back with paired-rename
+// ---------------------------------------------------------------------------
+
+/// A `RenameFrom` we've seen but whose paired `RenameTo` hasn't arrived
+/// yet. Sits in the pending-rename cache for RENAME_PAIR_WINDOW.
+struct PendingRename {
+    side: OutboxSide,
+    seen_at: Instant,
+}
 
 fn handle_event(
     acct_name: &str,
     outbox: &Path,
-    failed: &Path,
     sidecar_dir: &Path,
     known_failures: &mut HashSet<String>,
+    pending_renames: &mut HashMap<String, PendingRename>,
+    retry_queue: &mut RetrySchedule,
     ev: OutboxEvent,
 ) {
     let filename = match ev.path.file_name().and_then(|s| s.to_str()) {
@@ -194,113 +792,440 @@ fn handle_event(
     };
     let basename = strip_flags(&filename);
 
-    // Dot-files: emacs backup residue, editor swap files, etc. tmp/ is
-    // already filtered upstream in classify_path.
     if filename.starts_with('.') {
         return;
     }
 
-    match (ev.side, ev.kind_is_create_or_move_to, ev.kind_is_remove) {
-        (OutboxSide::Outbox, true, _) => {
-            // A file appearing in Outbox/{new,cur} — either a fresh
-            // jmapqueue write or a drag-back from Failed/.
-            let intent = load_intent(sidecar_dir, &basename);
-            if known_failures.remove(&basename) {
-                info!(
-                    "[{acct_name}/submit] drag-back Failed→Outbox: {basename} \
-                     (would strip X-JMAP-* headers + resubmit) — {intent}"
-                );
-            } else {
-                info!("[{acct_name}/submit] queued: {basename} — {intent}");
+    match (ev.side, ev.kind, ev.subdir.as_str()) {
+        // ---- Outbox side ---------------------------------------------
+        (OutboxSide::Outbox, RawEventKind::CreateOrRenameTo, _) => {
+            // Was this the To half of a Failed→Outbox drag-back?
+            if let Some(pending) = pending_renames.remove(&basename) {
+                if matches!(pending.side, OutboxSide::Failed) {
+                    // Paired: perform atomic Family-2 header strip on
+                    // the Outbox file, then enqueue.
+                    known_failures.remove(&basename);
+                    if let Err(e) = strip_family2_headers_in_place(&ev.path) {
+                        warn!(
+                            "[{acct_name}/submit] drag-back {basename}: header strip: {e:#}"
+                        );
+                    }
+                    // Reset the sidecar's retry state — user says try again.
+                    reset_sidecar_for_retry(sidecar_dir, &basename);
+                    info!("[{acct_name}/submit] drag-back Failed→Outbox: {basename}");
+                    retry_queue.schedule(basename, Instant::now());
+                    return;
+                }
+                // The pending was from the Outbox side — self-rename
+                // (rare; MUA reflow). Treat as fresh queue.
             }
+            info!("[{acct_name}/submit] queued: {basename}");
+            retry_queue.schedule(basename, Instant::now());
         }
-        (OutboxSide::Outbox, false, true) => {
-            // File removed from Outbox — either an MUA :delete on a
-            // queued message, or (in Phase E) our own unlink after a
-            // successful submission. Log-only for Phase D.
+        (OutboxSide::Outbox, RawEventKind::Remove, _) => {
             debug!("[{acct_name}/submit] outbox unlinked: {basename}");
+            retry_queue.remove(&basename);
         }
-        (OutboxSide::Failed, true, _) => {
+        (OutboxSide::Outbox, RawEventKind::RenameFrom, _) => {
+            // File is leaving Outbox — could be a move to Failed (our
+            // own action, or a user relocate). Cache and wait.
+            pending_renames.insert(
+                basename.clone(),
+                PendingRename {
+                    side: OutboxSide::Outbox,
+                    seen_at: Instant::now(),
+                },
+            );
+        }
+
+        // ---- Failed side ---------------------------------------------
+        (OutboxSide::Failed, RawEventKind::CreateOrRenameTo, _) => {
             known_failures.insert(basename.clone());
+            retry_queue.remove(&basename);
             info!("[{acct_name}/submit] moved to Failed/: {basename}");
         }
-        (OutboxSide::Failed, false, true) => {
+        (OutboxSide::Failed, RawEventKind::Remove, _) => {
             if known_failures.remove(&basename) {
-                info!("[{acct_name}/submit] Failed/{basename} unlinked (user cleanup)");
+                debug!("[{acct_name}/submit] Failed/{basename} unlinked");
             }
         }
-        _ => {}
+        (OutboxSide::Failed, RawEventKind::RenameFrom, _) => {
+            // Drag-back is starting: file is leaving Failed. Wait for
+            // the paired RenameTo on Outbox.
+            pending_renames.insert(
+                basename.clone(),
+                PendingRename {
+                    side: OutboxSide::Failed,
+                    seen_at: Instant::now(),
+                },
+            );
+        }
     }
-    let _ = (outbox, failed); // silence unused params (kept for future use)
+
+    let _ = outbox;
+}
+
+/// Discard rename-from cache entries whose paired rename-to never
+/// arrived within RENAME_PAIR_WINDOW. A stale entry means the file
+/// really did just leave that side (delete, external mv to elsewhere).
+fn expire_pending_renames(
+    pending_renames: &mut HashMap<String, PendingRename>,
+    known_failures: &mut HashSet<String>,
+    _acct_name: &str,
+) {
+    let now = Instant::now();
+    let expired: Vec<String> = pending_renames
+        .iter()
+        .filter(|(_, p)| now.duration_since(p.seen_at) > RENAME_PAIR_WINDOW)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for name in expired {
+        if let Some(pending) = pending_renames.remove(&name) {
+            if matches!(pending.side, OutboxSide::Failed) {
+                // Truly left Failed. Drop from the tracked set.
+                known_failures.remove(&name);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Sidecar loading + intent formatting
+// Family-2 headers: inject on move-to-Failed, strip on drag-back
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct Sidecar {
+/// Rewrite the on-disk file with all `X-JMAP-Failure`, `X-JMAP-Failed-At`,
+/// and `X-JMAP-Ulid` headers removed. Atomic: write to `<path>.tmp` in
+/// the same directory, `fsync`, rename over the original.
+fn strip_family2_headers_in_place(path: &Path) -> Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let stripped = strip_family2_headers(&bytes);
+    if stripped == bytes {
+        return Ok(());
+    }
+    let tmp_path = tmp_neighbour(path);
+    let mut f = std::fs::File::create(&tmp_path)
+        .with_context(|| format!("create {}", tmp_path.display()))?;
+    f.write_all(&stripped)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename {} → {}", tmp_path.display(), path.display()))?;
+    Ok(())
+}
+
+fn tmp_neighbour(path: &Path) -> PathBuf {
+    let mut base = path.to_path_buf();
+    let name = base
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("message");
+    let new_name = format!(".{name}.jmapsyncd-tmp");
+    base.set_file_name(new_name);
+    base
+}
+
+/// Return the message bytes with the three Family-2 header lines removed.
+/// RFC 5322-aware (folded continuations are treated as part of the header).
+fn strip_family2_headers(bytes: &[u8]) -> Vec<u8> {
+    let (header, body) = split_header_body(bytes);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < header.len() {
+        // Find end-of-line
+        let line_end = find_line_end(&header[i..]);
+        let line_slice = &header[i..i + line_end];
+        // How many following folded lines to skip along with this one?
+        let mut skip = line_end;
+        while i + skip < header.len() {
+            let next_start = i + skip;
+            if starts_with_folded_continuation(&header[next_start..]) {
+                skip += find_line_end(&header[next_start..]);
+            } else {
+                break;
+            }
+        }
+        if is_family2_header_line(line_slice) {
+            // Drop this header (and any folded continuation lines).
+        } else {
+            out.extend_from_slice(&header[i..i + skip]);
+        }
+        i += skip;
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// Prepend the three Family-2 headers to the message (before any
+/// existing headers). Returns a fresh Vec<u8> with the augmented bytes.
+fn inject_family2_headers(bytes: &[u8], reason: &str, ulid: &str) -> Vec<u8> {
+    let now = iso_now();
+    // Sanitize the reason into a single header line — collapse any
+    // whitespace so we never emit a folded/bogus header value.
+    let sanitized_reason: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let prefix = format!(
+        "X-JMAP-Failure: {sanitized_reason}\r\nX-JMAP-Failed-At: {now}\r\nX-JMAP-Ulid: {ulid}\r\n"
+    );
+    let mut out = Vec::with_capacity(bytes.len() + prefix.len());
+    out.extend_from_slice(prefix.as_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+fn is_family2_header_line(line: &[u8]) -> bool {
+    for name in ["X-JMAP-Failure:", "X-JMAP-Failed-At:", "X-JMAP-Ulid:"] {
+        if line_starts_with_header_ci(line, name.as_bytes()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Case-insensitive header-name prefix match (name includes the colon).
+fn line_starts_with_header_ci(line: &[u8], name_with_colon: &[u8]) -> bool {
+    if line.len() < name_with_colon.len() {
+        return false;
+    }
+    line[..name_with_colon.len()]
+        .iter()
+        .zip(name_with_colon.iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn starts_with_folded_continuation(rest: &[u8]) -> bool {
+    matches!(rest.first(), Some(b' ' | b'\t'))
+}
+
+fn find_line_end(bytes: &[u8]) -> usize {
+    // Advance to (and past) the next LF; if the line ends in CRLF, we
+    // still consume just up to (and including) the LF.
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            return i + 1;
+        }
+    }
+    bytes.len()
+}
+
+/// Split at the first blank line (CRLFCRLF or LFLF). Returns
+/// `(header_including_blank_line, body)`. When there's no blank line
+/// (malformed message), treat the whole thing as header, empty body.
+fn split_header_body(bytes: &[u8]) -> (&[u8], &[u8]) {
+    // Look for \r\n\r\n first, then fall back to \n\n.
+    if let Some(pos) = find_subseq(bytes, b"\r\n\r\n") {
+        let end = pos + 4;
+        return (&bytes[..end], &bytes[end..]);
+    }
+    if let Some(pos) = find_subseq(bytes, b"\n\n") {
+        let end = pos + 2;
+        return (&bytes[..end], &bytes[end..]);
+    }
+    (bytes, &[])
+}
+
+fn find_subseq(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return None;
+    }
+    bytes.windows(needle.len()).position(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
+// Move-to-Failed
+// ---------------------------------------------------------------------------
+
+/// Atomically move `<src>` → `<failed>/new/<basename>`, injecting the
+/// Family-2 diagnostic headers into the payload. Writes to
+/// `<failed>/tmp/<basename>` first, fsyncs, then renames.
+fn move_to_failed_atomic(
+    src: &Path,
+    failed_dir: &Path,
+    basename: &str,
+    reason: &str,
+    ulid: &str,
+) -> Result<PathBuf> {
+    let bytes = std::fs::read(src).with_context(|| format!("read {}", src.display()))?;
+    let annotated = inject_family2_headers(&bytes, reason, ulid);
+
+    let tmp_path = failed_dir.join("tmp").join(basename);
+    let new_path = failed_dir.join("new").join(basename);
+    std::fs::create_dir_all(failed_dir.join("tmp"))?;
+    std::fs::create_dir_all(failed_dir.join("new"))?;
+
+    {
+        let mut f = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("create {}", tmp_path.display()))?;
+        f.write_all(&annotated)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &new_path)
+        .with_context(|| format!("rename {} → {}", tmp_path.display(), new_path.display()))?;
+    // Unlink the source (in the Outbox side). If the source and dest
+    // are the same file (should never happen, guarded by our path
+    // construction), the rename above already moved it and there's
+    // nothing to unlink.
+    if src != new_path {
+        let _ = std::fs::remove_file(src);
+    }
+    Ok(new_path)
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar state
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct SidecarState {
     envelope: Envelope,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     send_at: Option<String>,
     #[serde(default)]
-    account: String,
+    submitted_at: String,
     #[serde(default)]
+    account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     retry: Option<RetryState>,
+    /// Set at the moment of the first network call for this attempt;
+    /// cleared on any terminal outcome. A stale in_flight at startup
+    /// = daemon crashed mid-submit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    in_flight: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 struct Envelope {
+    #[serde(default)]
     from: String,
+    #[serde(default)]
     to: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 struct RetryState {
     #[serde(default)]
     attempts: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     next_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
-/// Human-readable one-liner for logs. Silently returns a placeholder if
-/// the sidecar is missing or malformed — a missing sidecar is a bug we
-/// want visible in logs, not a reason to skip the event.
-fn load_intent(sidecar_dir: &Path, basename: &str) -> String {
-    let path = sidecar_dir.join(format!("{basename}.json"));
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return format!("<no sidecar at {}>", path.display()),
-    };
-    let sc: Sidecar = match serde_json::from_slice(&bytes) {
-        Ok(s) => s,
-        Err(e) => return format!("<sidecar {} malformed: {e}>", path.display()),
-    };
-    let retry_note = sc
-        .retry
-        .as_ref()
-        .filter(|r| r.attempts > 0)
-        .map(|r| {
-            format!(
-                " retry attempt={} next_at={}",
-                r.attempts,
-                r.next_at.as_deref().unwrap_or("<unset>")
-            )
+impl RetryState {
+    fn next_at_epoch_secs(&self) -> Option<u64> {
+        self.next_at
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc).timestamp().max(0) as u64)
+    }
+}
+
+impl SidecarState {
+    fn load(sidecar_dir: &Path, basename: &str) -> Self {
+        let path = sidecar_dir.join(format!("{basename}.json"));
+        let Ok(bytes) = std::fs::read(&path) else {
+            return SidecarState::default();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            warn!("sidecar {} malformed ({e}); treating as empty", path.display());
+            SidecarState::default()
         })
-        .unwrap_or_default();
-    let send_at_note = sc
-        .send_at
-        .as_ref()
-        .map(|s| format!(" send_at={s}"))
-        .unwrap_or_default();
-    format!(
-        "from={} to={:?}{send_at_note}{retry_note}",
-        sc.envelope.from, sc.envelope.to
-    )
+    }
+
+    fn save(&self, sidecar_dir: &Path, basename: &str) -> Result<()> {
+        let final_path = sidecar_dir.join(format!("{basename}.json"));
+        let tmp_path = sidecar_dir.join(format!(".{basename}.json.tmp"));
+        let bytes = serde_json::to_vec_pretty(self)?;
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    fn format_log(&self) -> String {
+        let retry_note = self
+            .retry
+            .as_ref()
+            .filter(|r| r.attempts > 0)
+            .map(|r| {
+                format!(
+                    " retry attempts={} next_at={}",
+                    r.attempts,
+                    r.next_at.as_deref().unwrap_or("<unset>")
+                )
+            })
+            .unwrap_or_default();
+        let send_at_note = self
+            .send_at
+            .as_ref()
+            .map(|s| format!(" send_at={s}"))
+            .unwrap_or_default();
+        let in_flight_note = self
+            .in_flight
+            .as_ref()
+            .map(|s| format!(" in_flight={s}"))
+            .unwrap_or_default();
+        format!(
+            "from={} to={:?}{send_at_note}{retry_note}{in_flight_note}",
+            self.envelope.from, self.envelope.to
+        )
+    }
+}
+
+fn reset_sidecar_for_retry(sidecar_dir: &Path, basename: &str) {
+    let mut sc = SidecarState::load(sidecar_dir, basename);
+    sc.retry = None;
+    sc.in_flight = None;
+    if let Err(e) = sc.save(sidecar_dir, basename) {
+        warn!("reset sidecar for {basename}: {e:#}");
+    }
+}
+
+fn warn_on_stale_inflight(sidecar_dir: &Path, acct_name: &str) {
+    let Ok(rd) = std::fs::read_dir(sidecar_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".json") || name.starts_with('.') {
+            continue;
+        }
+        let basename = name.trim_end_matches(".json");
+        let sc = SidecarState::load(sidecar_dir, basename);
+        let Some(inflight_iso) = sc.in_flight.as_deref() else {
+            continue;
+        };
+        let stale = DateTime::parse_from_rfc3339(inflight_iso)
+            .ok()
+            .and_then(|dt| {
+                let inflight_sys = UNIX_EPOCH + Duration::from_secs(dt.timestamp().max(0) as u64);
+                now.duration_since(inflight_sys).ok()
+            })
+            .map(|d| d >= STARTUP_INFLIGHT_STALENESS)
+            .unwrap_or(true);
+        if stale {
+            warn!(
+                "[{acct_name}/submit] {basename}: possible mid-submit crash (in_flight since {inflight_iso}). \
+                 Will retry — RECIPIENT MAY SEE A DUPLICATE. \
+                 Check Fastmail Sent + Scheduled + submission log before letting the retry proceed."
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// notify → tokio bridge (per-file events, not just tick pings)
+// Notify → tokio bridge (per-file events)
 // ---------------------------------------------------------------------------
 
 struct OutboxWatchRx {
@@ -313,8 +1238,14 @@ struct OutboxEvent {
     side: OutboxSide,
     path: PathBuf,
     subdir: String,
-    kind_is_create_or_move_to: bool,
-    kind_is_remove: bool,
+    kind: RawEventKind,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+enum RawEventKind {
+    CreateOrRenameTo,
+    Remove,
+    RenameFrom,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -342,28 +1273,22 @@ fn spawn_outbox_watch(
             let Ok(event) = res else {
                 return;
             };
-            let (kind_create, kind_remove) = classify_event(&event.kind);
-            // Only transitional events (create / remove / rename) advance
-            // state. Data/metadata modifies on already-tracked files are
-            // ignored — otherwise cp / touch / editor saves cause spurious
-            // "moved to Failed/" repeats in the log.
-            if !kind_create && !kind_remove {
+            let raw_kind = classify_event(&event.kind);
+            let Some(raw_kind) = raw_kind else {
                 return;
-            }
+            };
             for path in event.paths.iter() {
-                let (side, subdir) =
-                    match classify_path(path, &outbox_owned, &failed_owned) {
-                        Some(x) => x,
-                        None => continue,
-                    };
-                let outbox_event = OutboxEvent {
+                let (side, subdir) = match classify_path(path, &outbox_owned, &failed_owned) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let ev = OutboxEvent {
                     side,
                     path: path.clone(),
                     subdir,
-                    kind_is_create_or_move_to: kind_create,
-                    kind_is_remove: kind_remove,
+                    kind: raw_kind,
                 };
-                let _ = raw_tx.blocking_send(outbox_event);
+                let _ = raw_tx.blocking_send(ev);
             }
         },
     )?;
@@ -374,15 +1299,9 @@ fn spawn_outbox_watch(
         .watch(failed, RecursiveMode::Recursive)
         .with_context(|| format!("watch {}", failed.display()))?;
 
-    // Debounce loop: coalesce same-path events within `debounce` — keeps
-    // the log tidy when an MUA move fires several inotify events on the
-    // same file in quick succession. Debounce is per (side, basename)
-    // pair so a Failed→Outbox drag-back doesn't get swallowed by a
-    // preceding Failed unlink.
+    // Debounce identical (side, basename, kind) events within `debounce`.
     spawn_local(async move {
-        use std::collections::HashMap;
-        use std::time::Instant;
-        let mut last: HashMap<(OutboxSide, String), Instant> = HashMap::new();
+        let mut last: HashMap<(OutboxSide, String, RawEventKind), Instant> = HashMap::new();
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -395,8 +1314,9 @@ fn spawn_outbox_watch(
                             .and_then(|s| s.to_str())
                             .unwrap_or("")
                             .to_string(),
+                        ev.kind,
                     );
-                    let now = std_now();
+                    let now = Instant::now();
                     if let Some(prev) = last.get(&key) {
                         if now.duration_since(*prev) < debounce {
                             continue;
@@ -417,25 +1337,21 @@ fn spawn_outbox_watch(
     })
 }
 
-fn classify_event(kind: &EventKind) -> (bool, bool) {
-    use notify::event::{ModifyKind, RenameMode};
-    let _ = CreateKind::File; // silence unused import if match arms shift
+fn classify_event(kind: &EventKind) -> Option<RawEventKind> {
     match kind {
-        EventKind::Create(_) => (true, false),
-        EventKind::Remove(_) => (false, true),
+        EventKind::Create(_) => Some(RawEventKind::CreateOrRenameTo),
+        EventKind::Remove(_) => Some(RawEventKind::Remove),
         EventKind::Modify(ModifyKind::Name(mode)) => match mode {
-            // rename-from = source is going away; treat as remove
-            RenameMode::From => (false, true),
-            // rename-to = target just materialized; treat as create
-            RenameMode::To => (true, false),
-            // Backends that fire "Both" or "Any" carry both paths in
-            // event.paths; the caller sees both events. Treat as create
-            // for the destination path (matching new_ event semantics).
-            _ => (true, false),
+            RenameMode::From => Some(RawEventKind::RenameFrom),
+            RenameMode::To => Some(RawEventKind::CreateOrRenameTo),
+            // "Both" and "Any" carry both source + dest paths in
+            // event.paths; treat as CreateOrRenameTo so the destination
+            // side of the rename triggers a queue action. The source
+            // path will be filtered out by classify_path anyway (it's
+            // no longer present on disk).
+            _ => Some(RawEventKind::CreateOrRenameTo),
         },
-        // Modify(Data | Metadata) — file was written to or touched.
-        // Not a state transition; ignored (returns (false, false)).
-        _ => (false, false),
+        _ => None,
     }
 }
 
@@ -453,15 +1369,9 @@ fn classify_path(
     };
     let rel = path.strip_prefix(base).ok()?;
     let subdir = rel.iter().next()?.to_str()?.to_string();
-    // `tmp/` is a mid-write staging area — jmapqueue writes there then
-    // atomically renames into `new/`. Filtering these events at the
-    // notify callback (before they enter the debounce map) keeps them
-    // from stealing the debounce slot from the real `new/` rename that
-    // follows a fraction of a millisecond later.
     if !matches!(subdir.as_str(), "new" | "cur") {
         return None;
     }
-    // Only events on the file itself, not the subdir.
     if rel.components().count() < 2 {
         return None;
     }
@@ -471,6 +1381,35 @@ fn classify_path(
 // ---------------------------------------------------------------------------
 // Filesystem helpers
 // ---------------------------------------------------------------------------
+
+fn locate_and_read_outbox_message(outbox: &Path, basename: &str) -> Result<(PathBuf, Vec<u8>)> {
+    // Try new/ first (jmapqueue's landing site), then cur/ (post-MUA-move
+    // variants — with any :2,flags suffix).
+    for sub in ["new", "cur"] {
+        let dir = outbox.join(sub);
+        // Fast path: exact-name match
+        let exact = dir.join(basename);
+        if exact.is_file() {
+            let bytes = std::fs::read(&exact)?;
+            return Ok((exact, bytes));
+        }
+        // Slow path: cur/ files carry :2,flags suffix; scan for prefix.
+        let prefix = format!("{basename}:2,");
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if name.starts_with(&prefix) {
+                    let bytes = std::fs::read(&path)?;
+                    return Ok((path, bytes));
+                }
+            }
+        }
+    }
+    Err(anyhow!("no file matching {basename} in Outbox/{{new,cur}}"))
+}
 
 fn scan_maildir_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -510,9 +1449,6 @@ fn filename_of(p: &Path) -> String {
         .to_string()
 }
 
-/// Strip the standard Maildir `:2,<flags>` suffix so drag-back
-/// bookkeeping and sidecar lookups work regardless of whether the file
-/// has been moved to `cur/` yet.
 fn strip_flags(name: &str) -> String {
     match name.rsplit_once(":2,") {
         Some((base, _)) => base.to_string(),
@@ -526,10 +1462,25 @@ fn sidecar_dir_for(account: &str) -> Result<PathBuf> {
     Ok(base.join("jmapsyncd").join(account).join("outbox-meta"))
 }
 
-// `std::time::Instant::now()` — wrapped in a helper so the tests can
-// stay deterministic if we ever need to swap in a mock clock.
-fn std_now() -> std::time::Instant {
-    std::time::Instant::now()
+// ---------------------------------------------------------------------------
+// Time helpers
+// ---------------------------------------------------------------------------
+
+fn iso_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn iso_from_epoch_secs(secs: u64) -> String {
+    DateTime::<Utc>::from_timestamp(secs as i64, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn epoch_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +1491,7 @@ fn std_now() -> std::time::Instant {
 mod tests {
     use super::*;
 
+    // ---- strip_flags -----------------------------------------------
     #[test]
     fn strip_flags_variants() {
         assert_eq!(strip_flags("foo.bar.host"), "foo.bar.host");
@@ -548,6 +1500,7 @@ mod tests {
         assert_eq!(strip_flags("foo.bar.host:2,SR"), "foo.bar.host");
     }
 
+    // ---- scan_maildir_files ----------------------------------------
     #[test]
     fn scan_maildir_files_skips_tmp_and_dotfiles() {
         let tmp = tempfile::tempdir().unwrap();
@@ -573,31 +1526,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scan_basenames_strips_flags() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("Failed");
-        for sub in ["tmp", "new", "cur"] {
-            std::fs::create_dir_all(root.join(sub)).unwrap();
-        }
-        std::fs::write(root.join("new/abc.host"), b"").unwrap();
-        std::fs::write(root.join("cur/def.host:2,S"), b"").unwrap();
-
-        let names = scan_basenames(&root);
-        assert!(names.contains("abc.host"));
-        assert!(names.contains("def.host"));
-        assert_eq!(names.len(), 2);
-    }
-
+    // ---- classify_path ---------------------------------------------
     #[test]
     fn classify_path_recognizes_outbox_and_failed() {
         let tmp = tempfile::tempdir().unwrap();
-        let outbox = tmp.path().join("Outbox").canonicalize();
-        let failed = tmp.path().join("Failed").canonicalize();
         std::fs::create_dir_all(tmp.path().join("Outbox/new")).unwrap();
         std::fs::create_dir_all(tmp.path().join("Failed/new")).unwrap();
-        let outbox = outbox.unwrap_or_else(|_| tmp.path().join("Outbox"));
-        let failed = failed.unwrap_or_else(|_| tmp.path().join("Failed"));
+        let outbox = tmp.path().join("Outbox").canonicalize().unwrap();
+        let failed = tmp.path().join("Failed").canonicalize().unwrap();
 
         let ob_file = outbox.join("new/foo");
         std::fs::write(&ob_file, b"").unwrap();
@@ -614,10 +1550,6 @@ mod tests {
 
     #[test]
     fn classify_path_rejects_tmp_events() {
-        // tmp/ is jmapqueue's staging dir; the rename to new/ is the
-        // one signal we want. Rejecting tmp events upstream prevents
-        // them from stealing the debounce slot from the paired new/
-        // event that follows a fraction of a millisecond later.
         let tmp = tempfile::tempdir().unwrap();
         let outbox = tmp.path().join("Outbox");
         let failed = tmp.path().join("Failed");
@@ -627,67 +1559,181 @@ mod tests {
         assert!(classify_path(&tmp_file, &outbox, &failed).is_none());
     }
 
+    // ---- RetrySchedule --------------------------------------------
     #[test]
-    fn classify_path_rejects_unknown_subdir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outbox = tmp.path().join("Outbox");
-        let failed = tmp.path().join("Failed");
-        std::fs::create_dir_all(outbox.join("bogus")).unwrap();
-        let bogus = outbox.join("bogus/x");
-        std::fs::write(&bogus, b"").unwrap();
-        assert!(classify_path(&bogus, &outbox, &failed).is_none());
+    fn retry_schedule_basic() {
+        let mut q = RetrySchedule::new();
+        let now = Instant::now();
+        q.schedule("a".into(), now);
+        q.schedule("b".into(), now + Duration::from_secs(1));
+        // Reschedule 'a' further out.
+        q.schedule("a".into(), now + Duration::from_secs(2));
+        let due = q.drain_due();
+        assert!(due.is_empty(), "nothing due at t=0 anymore");
+        // Fast-forward past b's due time by scheduling something at
+        // an earlier instant, then drain.
+        q.schedule("c".into(), now.checked_sub(Duration::from_secs(5)).unwrap_or(now));
+        let due = q.drain_due();
+        assert!(due.contains(&"c".to_string()));
     }
 
     #[test]
-    fn classify_path_rejects_outside_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outbox = tmp.path().join("Outbox");
-        let failed = tmp.path().join("Failed");
-        let elsewhere = tmp.path().join("Inbox/new/foo");
-        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
-        std::fs::write(&elsewhere, b"").unwrap();
-        assert!(classify_path(&elsewhere, &outbox, &failed).is_none());
+    fn retry_schedule_remove_clears_index_and_bucket() {
+        let mut q = RetrySchedule::new();
+        let when = Instant::now() + Duration::from_secs(60);
+        q.schedule("x".into(), when);
+        q.remove("x");
+        assert!(!q.index.contains_key("x"));
+        assert!(q.schedule.get(&when).is_none());
+    }
+
+    // ---- backoff_delay ---------------------------------------------
+    #[test]
+    fn backoff_delay_grows_then_caps() {
+        let a1 = backoff_delay(1, 30, 7200);
+        // ~30s ±20%: 24..=36
+        assert!(a1.as_secs_f64() >= 24.0 && a1.as_secs_f64() <= 36.0);
+        let a2 = backoff_delay(2, 30, 7200);
+        // ~60s ±20%: 48..=72
+        assert!(a2.as_secs_f64() >= 48.0 && a2.as_secs_f64() <= 72.0);
+        let capped = backoff_delay(20, 30, 7200);
+        // Cap at 7200; jitter still applies within ±20%.
+        assert!(capped.as_secs_f64() <= 7200.0 * 1.201);
+        assert!(capped.as_secs_f64() >= 7200.0 * 0.799);
+    }
+
+    // ---- header inject / strip ------------------------------------
+    fn body_bytes() -> &'static [u8] {
+        b"To: dest@example\r\nFrom: me@example\r\nSubject: hi\r\n\r\nbody line\r\n"
     }
 
     #[test]
-    fn load_intent_missing_sidecar_returns_placeholder() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = load_intent(tmp.path(), "does-not-exist");
-        assert!(s.contains("no sidecar"));
+    fn inject_family2_prepends_three_headers() {
+        let out = inject_family2_headers(body_bytes(), "notFound", "01H123");
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.starts_with("X-JMAP-Failure: notFound\r\n"));
+        assert!(s.contains("X-JMAP-Failed-At: "));
+        assert!(s.contains("X-JMAP-Ulid: 01H123\r\n"));
+        assert!(s.ends_with("body line\r\n"));
     }
 
     #[test]
-    fn load_intent_formats_full_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sidecar_dir = tmp.path();
-        std::fs::write(
-            sidecar_dir.join("m1.json"),
-            r#"{"envelope":{"from":"a@b","to":["c@d"]},"send_at":"2026-08-01T09:00:00Z","account":"personal","retry":{"attempts":0}}"#,
-        ).unwrap();
-        let s = load_intent(sidecar_dir, "m1");
-        assert!(s.contains("from=a@b"));
-        assert!(s.contains("c@d"));
-        assert!(s.contains("send_at=2026-08-01T09:00:00Z"));
-        assert!(!s.contains("retry"));
+    fn strip_family2_removes_all_three() {
+        let annotated = inject_family2_headers(body_bytes(), "identityId notFound", "01HULID");
+        let stripped = strip_family2_headers(&annotated);
+        // Round-trip: stripped == original
+        assert_eq!(stripped, body_bytes().to_vec());
     }
 
     #[test]
-    fn load_intent_surfaces_retry_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("m2.json"),
-            r#"{"envelope":{"from":"a@b","to":["c@d"]},"account":"personal","retry":{"attempts":3,"next_at":"2026-08-01T10:00:00Z"}}"#,
-        ).unwrap();
-        let s = load_intent(tmp.path(), "m2");
-        assert!(s.contains("attempt=3"));
-        assert!(s.contains("next_at=2026-08-01T10:00:00Z"));
+    fn strip_family2_preserves_case_variants() {
+        let msg = b"x-jmap-failure: broke\r\nX-JMAP-Failed-At: today\r\nX-JMAP-ULID: xxx\r\nSubject: hi\r\n\r\nbody";
+        let stripped = strip_family2_headers(msg);
+        let s = std::str::from_utf8(&stripped).unwrap();
+        assert!(!s.contains("X-JMAP-Failure"));
+        assert!(!s.contains("x-jmap-failure"));
+        assert!(!s.contains("X-JMAP-Failed-At"));
+        assert!(!s.contains("X-JMAP-ULID"));
+        assert!(s.starts_with("Subject: hi\r\n"));
     }
 
     #[test]
-    fn load_intent_malformed_returns_error_placeholder() {
+    fn strip_family2_leaves_body_alone() {
+        let msg = b"Subject: hi\r\n\r\nX-JMAP-Failure: this-is-in-the-body\r\n";
+        let stripped = strip_family2_headers(msg);
+        assert_eq!(stripped, msg.to_vec());
+    }
+
+    #[test]
+    fn strip_family2_handles_folded_continuation() {
+        let msg = b"X-JMAP-Failure: reason\r\n continued-fold\r\nSubject: hi\r\n\r\nbody";
+        let stripped = strip_family2_headers(msg);
+        let s = std::str::from_utf8(&stripped).unwrap();
+        assert!(!s.contains("X-JMAP-Failure"));
+        assert!(!s.contains("continued-fold"));
+        assert!(s.starts_with("Subject: hi\r\n"));
+    }
+
+    #[test]
+    fn inject_family2_sanitizes_multiline_reason() {
+        // A reason with embedded newlines must not break the header block.
+        let out = inject_family2_headers(body_bytes(), "line1\r\nline2\tblah", "01H");
+        let s = std::str::from_utf8(&out).unwrap();
+        let header_line = s.lines().next().unwrap();
+        assert!(header_line.starts_with("X-JMAP-Failure: line1 line2 blah"));
+    }
+
+    // ---- SidecarState r/w -----------------------------------------
+    #[test]
+    fn sidecar_roundtrip_with_in_flight() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("bad.json"), b"not-json").unwrap();
-        let s = load_intent(tmp.path(), "bad");
-        assert!(s.contains("malformed"));
+        let mut sc = SidecarState {
+            envelope: Envelope {
+                from: "a@b".into(),
+                to: vec!["c@d".into()],
+            },
+            send_at: Some("2026-08-01T09:00:00Z".into()),
+            submitted_at: "2026-08-01T08:59:00Z".into(),
+            account: "personal".into(),
+            retry: None,
+            in_flight: None,
+        };
+        sc.save(tmp.path(), "m1").unwrap();
+
+        let loaded = SidecarState::load(tmp.path(), "m1");
+        assert_eq!(loaded.envelope.from, "a@b");
+        assert_eq!(loaded.envelope.to, vec!["c@d".to_string()]);
+        assert_eq!(loaded.send_at.as_deref(), Some("2026-08-01T09:00:00Z"));
+        assert!(loaded.in_flight.is_none());
+
+        sc.in_flight = Some("2026-08-01T09:05:00Z".into());
+        sc.save(tmp.path(), "m1").unwrap();
+        let reloaded = SidecarState::load(tmp.path(), "m1");
+        assert_eq!(
+            reloaded.in_flight.as_deref(),
+            Some("2026-08-01T09:05:00Z")
+        );
+    }
+
+    #[test]
+    fn sidecar_missing_file_returns_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sc = SidecarState::load(tmp.path(), "does-not-exist");
+        assert_eq!(sc.envelope.from, "");
+        assert!(sc.envelope.to.is_empty());
+    }
+
+    // ---- SubmitOutcome classification -----------------------------
+    #[test]
+    fn method_error_server_unavailable_is_transient() {
+        let me = MethodError {
+            p_type: MethodErrorType::ServerUnavailable,
+        };
+        assert!(matches!(
+            SubmitOutcome::from_method_error(&me),
+            SubmitOutcome::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn method_error_forbidden_is_permanent() {
+        let me = MethodError {
+            p_type: MethodErrorType::Forbidden,
+        };
+        assert!(matches!(
+            SubmitOutcome::from_method_error(&me),
+            SubmitOutcome::Permanent(_)
+        ));
+    }
+
+    #[test]
+    fn method_error_account_read_only_is_permanent() {
+        let me = MethodError {
+            p_type: MethodErrorType::AccountReadOnly,
+        };
+        assert!(matches!(
+            SubmitOutcome::from_method_error(&me),
+            SubmitOutcome::Permanent(_)
+        ));
     }
 }
