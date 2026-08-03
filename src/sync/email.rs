@@ -646,9 +646,30 @@ async fn apply_writeback(
         match c {
             LocalChange::Destroy { jmap_id, .. } => destroy_ids.push(jmap_id.clone()),
             LocalChange::UpdateKeywords { jmap_id, new_flags, .. } => {
+                // Diff stored keyword state (SQLite) against the disk's
+                // standard-flag subset and emit ONLY the ops that flipped
+                // direction. Blindly writing all four every tick (the
+                // old behaviour) both wasted requests and — combined
+                // with Bug #2's false-for-null bug — put spec-invalid
+                // patches on the wire on every sync.
+                let stored_flags = local_by_jmap
+                    .get(jmap_id)
+                    .and_then(|r| r.keywords.as_deref())
+                    .map(extract_standard_flags)
+                    .unwrap_or_default();
+                let ops = keyword_patch_ops(&stored_flags, new_flags);
+                if ops.is_empty() {
+                    // Nothing to send; skip building an update at all so
+                    // the outgoing request stays minimal.
+                    continue;
+                }
                 let update = set.update(jmap_id.as_str());
-                for (kw, ch) in KEYWORD_MAP {
-                    update.keyword(kw, new_flags.contains(*ch));
+                for (kw, should_set) in ops {
+                    if should_set {
+                        update.keyword(kw, true);
+                    } else {
+                        update.unset_keyword(kw);
+                    }
                 }
             }
         }
@@ -667,31 +688,37 @@ async fn apply_writeback(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let not_destroyed_count = response
+    let not_destroyed_ids: Vec<String> = response
         .not_destroyed_ids()
-        .map(|it| it.count())
-        .unwrap_or(0);
+        .map(|it| it.cloned().collect())
+        .unwrap_or_default();
     let updated_ids: HashSet<String> = response
         .take_updated_ids()
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let not_updated_count = response
+    let not_updated_ids: Vec<String> = response
         .not_updated_ids()
-        .map(|it| it.count())
-        .unwrap_or(0);
+        .map(|it| it.cloned().collect())
+        .unwrap_or_default();
 
-    if not_destroyed_count > 0 {
-        warn!(
-            "write-back: {} destroy request(s) rejected by server; will retry next tick",
-            not_destroyed_count
-        );
+    if !not_destroyed_ids.is_empty() {
+        // Surface WHICH ids failed so the loop can be diagnosed instead
+        // of silently spamming "will retry next tick" forever.
+        for id in &not_destroyed_ids {
+            match response.destroyed(id) {
+                Err(e) => warn!("write-back destroy rejected: {id}: {e}"),
+                Ok(_) => warn!("write-back destroy rejected (no detail): {id}"),
+            }
+        }
     }
-    if not_updated_count > 0 {
-        warn!(
-            "write-back: {} keyword update(s) rejected by server; will retry next tick",
-            not_updated_count
-        );
+    if !not_updated_ids.is_empty() {
+        for id in &not_updated_ids {
+            match response.updated(id) {
+                Err(e) => warn!("write-back update rejected: {id}: {e}"),
+                Ok(_) => warn!("write-back update rejected (no detail): {id}"),
+            }
+        }
     }
 
     // Reconcile local state with what the server actually did. For
@@ -802,6 +829,44 @@ fn merge_keywords_json(stored_json: &str, disk_flags: &str) -> String {
         }
     }
     serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Extract the standard-subset Maildir flag chars (S/F/R/D) that are
+/// currently marked `true` in the stored `keywords` JSON. Non-standard
+/// server-side labels are ignored. Returned string is ASCII-sorted for
+/// deterministic comparison with `disk_flags`.
+fn extract_standard_flags(stored_keywords_json: &str) -> String {
+    let parsed: BTreeMap<String, bool> =
+        serde_json::from_str(stored_keywords_json).unwrap_or_default();
+    let mut flags: Vec<char> = KEYWORD_MAP
+        .iter()
+        .filter(|(kw, _)| parsed.get(*kw).copied().unwrap_or(false))
+        .map(|(_, ch)| *ch)
+        .collect();
+    flags.sort();
+    flags.into_iter().collect()
+}
+
+/// Per-keyword diff between the stored standard-flag subset and the
+/// disk's standard-flag subset. Returns `(keyword_name, should_set)`
+/// tuples ONLY for keywords whose direction changed:
+///   * `should_set == true`  → caller should emit `keyword(kw, true)`
+///   * `should_set == false` → caller should emit `unset_keyword(kw)` (JSON null)
+///
+/// Skipping unchanged keywords is not a hygiene nicety — it's how we
+/// stop `apply_writeback` from spamming Fastmail with four patches per
+/// email every sync tick when only one flag flipped (Bug #5 in the
+/// jmapsyncd Phase E catalog).
+fn keyword_patch_ops(stored_flags: &str, new_flags: &str) -> Vec<(&'static str, bool)> {
+    let mut ops = Vec::new();
+    for (kw, ch) in KEYWORD_MAP {
+        let stored_has = stored_flags.contains(*ch);
+        let new_has = new_flags.contains(*ch);
+        if stored_has != new_has {
+            ops.push((*kw, new_has));
+        }
+    }
+    ops
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,5 +1429,91 @@ mod tests {
             changes.is_empty(),
             "non-T non-standard flags must not trigger writeback: {changes:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Bug #5: apply_writeback must send patches ONLY for keywords that
+    // actually changed direction between stored keywords and disk flags.
+    // The pre-fix loop blindly emitted all four KEYWORD_MAP entries every
+    // tick, generating three no-op patches (and one meaningful one) per
+    // email — a busy inbox turned this into a torrent of spec-invalid
+    // requests once combined with Bug #2 (false-for-null keyword removal).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn keyword_patch_ops_noop_when_flags_match() {
+        assert!(super::keyword_patch_ops("S", "S").is_empty());
+        assert!(super::keyword_patch_ops("SFRD", "SFRD").is_empty());
+        assert!(super::keyword_patch_ops("", "").is_empty());
+    }
+
+    #[test]
+    fn keyword_patch_ops_single_flag_added() {
+        // Only $flagged flipped false→true; the other three keywords are
+        // unchanged and must not appear in the diff.
+        let ops = super::keyword_patch_ops("S", "FS");
+        assert_eq!(ops, vec![("$flagged", true)]);
+    }
+
+    #[test]
+    fn keyword_patch_ops_single_flag_removed() {
+        // Only $flagged flipped true→false; emit a single unset op
+        // (represented as `("$flagged", false)`, which apply_writeback
+        // translates into `update.unset_keyword("$flagged")` → JSON null).
+        let ops = super::keyword_patch_ops("FS", "S");
+        assert_eq!(ops, vec![("$flagged", false)]);
+    }
+
+    #[test]
+    fn keyword_patch_ops_mixed_add_and_remove() {
+        // $seen stays, $flagged goes away, $draft gets added.
+        // (Answered is unchanged in both — must not appear.)
+        let ops = super::keyword_patch_ops("FS", "DS");
+        assert_eq!(
+            ops,
+            vec![("$flagged", false), ("$draft", true)],
+            "KEYWORD_MAP declares $flagged before $draft, so that's the emit order"
+        );
+    }
+
+    #[test]
+    fn keyword_patch_ops_full_reset() {
+        // Fresh unseen → user marks everything (theoretical). Four ops.
+        let ops = super::keyword_patch_ops("", "SFRD");
+        assert_eq!(
+            ops,
+            vec![
+                ("$seen", true),
+                ("$flagged", true),
+                ("$answered", true),
+                ("$draft", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_standard_flags_empty_json() {
+        assert_eq!(super::extract_standard_flags("{}"), "");
+    }
+
+    #[test]
+    fn extract_standard_flags_preserves_only_standard_subset() {
+        // Non-standard label ("junk") is ignored; standard keys returned
+        // as ASCII-sorted flag chars.
+        let json = r#"{"$seen":true,"$flagged":true,"junk":true}"#;
+        assert_eq!(super::extract_standard_flags(json), "FS");
+    }
+
+    #[test]
+    fn extract_standard_flags_false_entries_are_absent() {
+        // A stored `"$flagged": false` (should never happen, but be safe)
+        // must not be reported as an active flag.
+        let json = r#"{"$seen":true,"$flagged":false}"#;
+        assert_eq!(super::extract_standard_flags(json), "S");
+    }
+
+    #[test]
+    fn extract_standard_flags_bad_json_defaults_empty() {
+        assert_eq!(super::extract_standard_flags("not-json"), "");
     }
 }
