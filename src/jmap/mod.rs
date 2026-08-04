@@ -5,19 +5,34 @@ use jmap_client::client::{Client, Credentials};
 use jmap_client::core::request::Request;
 use std::time::Duration;
 
-/// Restrict a request's `using` capability list to just what jmapsyncd
-/// actually needs (Core + Mail). jmap-client 0.4 declares the full URI
-/// enum by default — including :sieve and :websocket, which Fastmail
-/// rejects with a 400 (`error:unknownCapability`) because they aren't
-/// on that account's advertised capability set.
+/// Restrict a request's `using` capability list to what jmapsyncd
+/// actually uses (Core + Mail + Submission). jmap-client 0.4 declares
+/// the full URI enum by default — including :sieve and :websocket,
+/// which Fastmail rejects with a 400 (`error:unknownCapability`)
+/// because they aren't on that account's advertised capability set.
+///
+/// Submission is required for `Identity/get`, `EmailSubmission/set`,
+/// `EmailSubmission/query`, and the `EmailDelivery` push-type on
+/// Fastmail. Adding it to the shared restrict is cheaper than a
+/// per-call-site distinction and correct for every Fastmail-ish
+/// server we care about (send is not optional for a mail account).
 ///
 /// TODO: derive this from the session's advertised capabilities so any
 /// JMAP provider works without having to know its supported URIs
 /// ahead of time.
 pub fn restrict_using(request: &mut Request<'_>) {
-    request.using.clear();
-    request.using.push(URI::Core);
-    request.using.push(URI::Mail);
+    apply_using_restriction(&mut request.using);
+}
+
+/// Pure inner: takes the `using` vec directly so the invariant is
+/// testable without spinning up a live Client. Callers should reach
+/// for `restrict_using(&mut request)` instead of this — it exists
+/// so the tests below can lock down which capabilities we advertise.
+fn apply_using_restriction(using: &mut Vec<URI>) {
+    using.clear();
+    using.push(URI::Core);
+    using.push(URI::Mail);
+    using.push(URI::Submission);
 }
 
 pub async fn client_from_account(acct: &Account) -> Result<Client> {
@@ -191,5 +206,66 @@ mod tests {
     fn extract_host_empty_errors() {
         assert!(extract_host("").is_err());
         assert!(extract_host("https://").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Bug #1: restrict_using must include URI::Submission so
+    // Identity/get, EmailSubmission/set, EmailSubmission/query, and the
+    // EmailDelivery push-type on Fastmail can be issued. Without it,
+    // every Phase-E submit round-trips a `urn:ietf:params:jmap:error:
+    // unknownCapability` — the daemon then classifies it as a
+    // transient network error and retries in a tight loop.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn restrict_using_installs_core_mail_submission() {
+        // Simulates jmap-client 0.4.2's default `Request::new` `using`
+        // vec — 11 URIs, notably including WebSocket + Sieve which
+        // Fastmail rejects (unknownCapability 400) when advertised.
+        let mut using = vec![
+            URI::Core,
+            URI::Mail,
+            URI::Submission,
+            URI::VacationResponse,
+            URI::Contacts,
+            URI::Calendars,
+            URI::WebSocket,
+            URI::Sieve,
+            URI::Blob,
+            URI::Quota,
+            URI::Principals,
+        ];
+        apply_using_restriction(&mut using);
+        assert_eq!(
+            using,
+            vec![URI::Core, URI::Mail, URI::Submission],
+            "must expose exactly Core+Mail+Submission and nothing else"
+        );
+    }
+
+    #[test]
+    fn restrict_using_drops_websocket_and_sieve() {
+        // Explicit guard on the two URIs that made Fastmail return 400
+        // before the restrict landed. Kept separate from the shape
+        // assertion above so a future addition (e.g. Blob) doesn't
+        // silently mask a regression on these two.
+        let mut using = vec![URI::WebSocket, URI::Sieve];
+        apply_using_restriction(&mut using);
+        assert!(!using.contains(&URI::WebSocket));
+        assert!(!using.contains(&URI::Sieve));
+    }
+
+    #[test]
+    fn restrict_using_is_idempotent() {
+        let mut using = vec![URI::Core, URI::Mail, URI::Submission];
+        apply_using_restriction(&mut using);
+        assert_eq!(using, vec![URI::Core, URI::Mail, URI::Submission]);
+    }
+
+    #[test]
+    fn restrict_using_from_empty_still_installs_capabilities() {
+        let mut using = vec![];
+        apply_using_restriction(&mut using);
+        assert_eq!(using, vec![URI::Core, URI::Mail, URI::Submission]);
     }
 }
