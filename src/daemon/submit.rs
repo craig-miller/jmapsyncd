@@ -641,6 +641,18 @@ async fn submit_one(
     msg_bytes: &[u8],
     sidecar: &SidecarState,
 ) -> SubmitOutcome {
+    // ---- Envelope sanity check (Bug #4) -----------------------------
+    // Reject sidecars with an empty envelope BEFORE touching the wire.
+    // A default-constructed SidecarState (e.g. a hand-created file, or
+    // one left over from Phase D testing before jmapqueue was writing
+    // real envelopes) parses as `from: ""`, `to: []` — Fastmail rejects
+    // those with a nested-JSON-pointer SetError that pre-Bug-#3 hard-
+    // failed to parse and pre-Bug-#1 didn't even reach the submission
+    // endpoint. Cheaper and more accurate to fail Permanent locally.
+    if let Some(reason) = envelope_validation_error(&sidecar.envelope) {
+        return SubmitOutcome::Permanent(reason);
+    }
+
     // ---- Parse send_at if present -----------------------------------
     let send_at_dt = match sidecar.send_at.as_deref() {
         None => None,
@@ -1103,6 +1115,21 @@ struct Envelope {
     from: String,
     #[serde(default)]
     to: Vec<String>,
+}
+
+/// Pre-submit envelope sanity check. Returns `Some(reason)` if the
+/// envelope is missing addresses SMTP requires (a sender and at least
+/// one non-blank recipient); `None` if the envelope is submittable.
+/// Whitespace-only strings count as absent so that a hand-authored
+/// sidecar with `"   "` in a field can't sneak past this check.
+fn envelope_validation_error(env: &Envelope) -> Option<String> {
+    if env.from.trim().is_empty() {
+        return Some("sidecar envelope missing `from`".to_string());
+    }
+    if env.to.iter().all(|s| s.trim().is_empty()) {
+        return Some("sidecar envelope missing `to`".to_string());
+    }
+    None
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -1735,5 +1762,86 @@ mod tests {
             SubmitOutcome::from_method_error(&me),
             SubmitOutcome::Permanent(_)
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Bug #4: envelope validation must happen BEFORE the Blob upload,
+    // so a default-empty SidecarState (`from: ""`, `to: []`) never
+    // reaches the wire. Pre-fix the daemon uploaded a blob + kicked
+    // off an Email/import that Fastmail then rejected, wasting a
+    // round-trip per retry tick.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn envelope_valid_returns_none() {
+        let env = Envelope {
+            from: "a@b".into(),
+            to: vec!["c@d".into()],
+        };
+        assert!(super::envelope_validation_error(&env).is_none());
+    }
+
+    #[test]
+    fn envelope_empty_from_returns_reason() {
+        let env = Envelope {
+            from: "".into(),
+            to: vec!["c@d".into()],
+        };
+        let reason = super::envelope_validation_error(&env).expect("must reject");
+        assert!(reason.contains("from"), "reason should name `from`: {reason}");
+    }
+
+    #[test]
+    fn envelope_whitespace_from_returns_reason() {
+        let env = Envelope {
+            from: "   \t\n".into(),
+            to: vec!["c@d".into()],
+        };
+        let reason = super::envelope_validation_error(&env).expect("must reject");
+        assert!(reason.contains("from"));
+    }
+
+    #[test]
+    fn envelope_empty_to_returns_reason() {
+        let env = Envelope {
+            from: "a@b".into(),
+            to: vec![],
+        };
+        let reason = super::envelope_validation_error(&env).expect("must reject");
+        assert!(reason.contains("to"), "reason should name `to`: {reason}");
+    }
+
+    #[test]
+    fn envelope_all_whitespace_to_returns_reason() {
+        // A `to` list containing only blank strings is functionally
+        // empty — SMTP would refuse it. Treat it as absent.
+        let env = Envelope {
+            from: "a@b".into(),
+            to: vec!["".into(), "  ".into(), "\t".into()],
+        };
+        let reason = super::envelope_validation_error(&env).expect("must reject");
+        assert!(reason.contains("to"));
+    }
+
+    #[test]
+    fn envelope_partial_whitespace_to_passes() {
+        // At least one recipient is a real address — that's a legal
+        // envelope. The blank entries are somebody else's problem
+        // (probably a UX gap in the composer), not ours to reject.
+        let env = Envelope {
+            from: "a@b".into(),
+            to: vec!["".into(), "c@d".into()],
+        };
+        assert!(super::envelope_validation_error(&env).is_none());
+    }
+
+    #[test]
+    fn envelope_default_construction_is_rejected() {
+        // The exact shape that leaked through pre-fix: a serde
+        // default-constructed SidecarState — `from: ""`, `to: []`.
+        // Locks down that this specific starting state can never be
+        // treated as submittable again.
+        let env = Envelope::default();
+        assert!(super::envelope_validation_error(&env).is_some());
     }
 }
