@@ -1132,6 +1132,70 @@ fn envelope_validation_error(env: &Envelope) -> Option<String> {
     None
 }
 
+/// What `submit_one` should do when Fastmail rejects `Email/import`
+/// with `alreadyExists` — i.e. Blob/upload deduplicated the message
+/// body against a message that's already on the server. The right
+/// answer depends on where the pre-existing copy currently lives and
+/// whether a pending `EmailSubmission` already targets it.
+///
+/// See Bug #8 in `jmapsyncd-phase-e-bug-catalog.md`. Standards
+/// reference: RFC 8621 §4.9 (Email/import), §7 (EmailSubmission).
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    /// Email is already in the account's Sent mailbox — the server
+    /// delivered it. Nothing more to do on this side; the sync loop
+    /// will pull the Sent copy down into the local Sent maildir
+    /// naturally, so aerc sees it without any special handling.
+    AlreadyDone,
+    /// Email is still in Drafts and at least one `EmailSubmission` is
+    /// pending. The user's drag-back expressed "make server state
+    /// match my sidecar," so cancel every pending submission (allowed
+    /// while `undoStatus == pending` — RFC 8621 §7.2) and create a
+    /// fresh submission with the sidecar's current `sendAt`. This
+    /// correctly handles both "same schedule, just retry" and "I
+    /// dragged this back to reschedule" without needing a local cache.
+    CancelAndResubmit {
+        destroy_ids: Vec<String>,
+        send_at: Option<DateTime<Utc>>,
+    },
+    /// Email is still in Drafts but no pending submission exists —
+    /// user wants to send now (or on the sidecar's schedule). Create a
+    /// fresh submission referencing the existing emailId directly.
+    CreateSubmission {
+        send_at: Option<DateTime<Utc>>,
+    },
+}
+
+/// Decide what to do about a message the server already has. Pure
+/// over `(server state, sidecar intent)`; the call site fetches state
+/// via a chained `Email/get` + `EmailSubmission/query` and translates
+/// the returned `ReconcileAction` into another JMAP round-trip.
+///
+/// The `AlreadyDone` branch takes priority over `CancelAndResubmit`:
+/// if the email appears in Sent at all (even alongside Drafts, which
+/// shouldn't happen but can under bizarre client concurrency) we
+/// treat the send as having succeeded. Better to no-op and let the
+/// user check than to cancel a finalized send and try to re-send it.
+fn reconcile_action(
+    email_mailbox_ids: &[String],
+    pending_submission_ids: &[String],
+    sent_id: &str,
+    sidecar_send_at: Option<DateTime<Utc>>,
+) -> ReconcileAction {
+    if email_mailbox_ids.iter().any(|m| m == sent_id) {
+        return ReconcileAction::AlreadyDone;
+    }
+    if !pending_submission_ids.is_empty() {
+        return ReconcileAction::CancelAndResubmit {
+            destroy_ids: pending_submission_ids.to_vec(),
+            send_at: sidecar_send_at,
+        };
+    }
+    ReconcileAction::CreateSubmission {
+        send_at: sidecar_send_at,
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 struct RetryState {
     #[serde(default)]
@@ -1843,5 +1907,104 @@ mod tests {
         // treated as submittable again.
         let env = Envelope::default();
         assert!(super::envelope_validation_error(&env).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // Bug #8: reconcile_action must translate (server state, sidecar
+    // intent) into the RFC-compliant next step on Email/import
+    // `alreadyExists`. Locks down every branch so future refactors
+    // can't silently regress into "always resubmit" or "always no-op".
+    // -----------------------------------------------------------------
+
+    fn sent() -> String { "MSENT01".to_string() }
+    fn drafts() -> String { "MDRFT01".to_string() }
+
+    #[test]
+    fn reconcile_email_in_sent_is_already_done() {
+        // Fastmail moved the message to Sent — delivery happened.
+        // Nothing to submit. Sync loop pulls the Sent copy down.
+        let action = super::reconcile_action(
+            &[sent()],
+            &["ES-pending".into()],  // even ignored if a stale query races
+            &sent(),
+            None,
+        );
+        assert_eq!(action, super::ReconcileAction::AlreadyDone);
+    }
+
+    #[test]
+    fn reconcile_email_in_both_sent_and_drafts_still_already_done() {
+        // Edge case: mailbox membership shows both. AlreadyDone wins;
+        // finalized send beats "there's a pending draft" ambiguity.
+        let action = super::reconcile_action(
+            &[drafts(), sent()],
+            &[],
+            &sent(),
+            None,
+        );
+        assert_eq!(action, super::ReconcileAction::AlreadyDone);
+    }
+
+    #[test]
+    fn reconcile_drafts_with_pending_cancels_and_resubmits() {
+        // Classic drag-back-to-reschedule: message is queued with a
+        // sendAt; user wants a new one. Destroy the pending submission
+        // and create a fresh one carrying the sidecar's new sendAt.
+        let ts = chrono::DateTime::<Utc>::from_timestamp(1_800_000_000, 0);
+        let action = super::reconcile_action(
+            &[drafts()],
+            &["ES-old-1".into(), "ES-old-2".into()],
+            &sent(),
+            ts,
+        );
+        assert_eq!(
+            action,
+            super::ReconcileAction::CancelAndResubmit {
+                destroy_ids: vec!["ES-old-1".into(), "ES-old-2".into()],
+                send_at: ts,
+            }
+        );
+    }
+
+    #[test]
+    fn reconcile_drafts_no_pending_creates_new_submission() {
+        // Message sits in Drafts with no submission pointing at it —
+        // user's drag-back means "send this." Create submission.
+        let action = super::reconcile_action(
+            &[drafts()],
+            &[],
+            &sent(),
+            None,
+        );
+        assert_eq!(
+            action,
+            super::ReconcileAction::CreateSubmission { send_at: None }
+        );
+    }
+
+    #[test]
+    fn reconcile_passes_send_at_through_unchanged() {
+        // Whatever the sidecar says, the action carries it verbatim —
+        // reconcile_action doesn't normalize or default sendAt.
+        let ts = chrono::DateTime::<Utc>::from_timestamp(1_900_000_000, 0);
+        let action = super::reconcile_action(&[drafts()], &[], &sent(), ts);
+        assert_eq!(
+            action,
+            super::ReconcileAction::CreateSubmission { send_at: ts }
+        );
+    }
+
+    #[test]
+    fn reconcile_no_mailbox_membership_still_creates_submission() {
+        // Defensive: if Email/get returned no mailboxIds (shouldn't
+        // happen — every email lives somewhere — but a partial
+        // response could look like this), treat as "not in Sent" and
+        // fall through to CreateSubmission rather than AlreadyDone,
+        // so we don't silently drop a legit re-submit.
+        let action = super::reconcile_action(&[], &[], &sent(), None);
+        assert_eq!(
+            action,
+            super::ReconcileAction::CreateSubmission { send_at: None }
+        );
     }
 }
