@@ -54,8 +54,10 @@ use jmap_client::{
     core::{
         error::{MethodError, MethodErrorType},
         response::{IdentityGetResponse, MailboxGetResponse, MethodResponse},
-        set::SetObject,
+        set::{SetError, SetErrorType, SetObject},
     },
+    email::Property as EmailProperty,
+    email_submission::{self, UndoStatus},
     mailbox::Role,
     Error as JmapError,
 };
@@ -730,9 +732,22 @@ async fn submit_one(
         Err(e) => return SubmitOutcome::from_jmap_error(e),
     };
 
+    // Bug #8: if Email/import fails with alreadyExists, park the
+    // existingId here and skip the cascade EmailSubmission/set errors
+    // (they're the inevitable fallout of the dangling #i0 reference).
+    // After the loop we dispatch to the reconcile path.
+    let mut already_exists_id: Option<String> = None;
+
     for tagged in resp.unwrap_method_responses() {
         match tagged.unwrap_method_response() {
-            MethodResponse::Error(me) => return SubmitOutcome::from_method_error(&me),
+            MethodResponse::Error(me) => {
+                if already_exists_id.is_some() {
+                    // Cascade error (invalidResultReference from the
+                    // dangling `#i0`). Reconcile below fixes things.
+                    continue;
+                }
+                return SubmitOutcome::from_method_error(&me);
+            }
             MethodResponse::ImportEmail(mut import_resp) => {
                 // EmailImportResponse doesn't expose the same helpers as
                 // SetResponse, so we drive it via its two id accessors.
@@ -743,11 +758,22 @@ async fn submit_one(
                     .map(|it| it.cloned().collect())
                     .unwrap_or_default();
                 if let Some(first) = not_created.first().cloned() {
-                    return match import_resp.created(&first) {
-                        Err(e) => SubmitOutcome::Permanent(format!("Email/import: {e}")),
-                        Ok(_) => SubmitOutcome::Permanent(format!(
-                            "Email/import not_created: {not_created:?}"
-                        )),
+                    match import_resp.created(&first) {
+                        Err(e) => {
+                            // Extract alreadyExists.existingId (RFC 8620
+                            // §5.3). If present, reconcile below rather
+                            // than surrender to Permanent.
+                            if let Some(id) = already_exists_id_from(&e) {
+                                already_exists_id = Some(id);
+                                continue;
+                            }
+                            return SubmitOutcome::Permanent(format!("Email/import: {e}"));
+                        }
+                        Ok(_) => {
+                            return SubmitOutcome::Permanent(format!(
+                                "Email/import not_created: {not_created:?}"
+                            ));
+                        }
                     };
                 }
                 let created: Vec<String> = import_resp
@@ -761,6 +787,10 @@ async fn submit_one(
                 }
             }
             MethodResponse::SetEmailSubmission(set_resp) => {
+                if already_exists_id.is_some() {
+                    // Same cascade suppression — reconcile owns this.
+                    continue;
+                }
                 if let Err(e) = set_resp.unwrap_create_errors() {
                     return SubmitOutcome::Permanent(format!("EmailSubmission/set: {e}"));
                 }
@@ -775,6 +805,207 @@ async fn submit_one(
         }
     }
 
+    if let Some(existing_id) = already_exists_id {
+        return reconcile_after_import(client, ctx, sidecar, &existing_id, send_at_dt).await;
+    }
+
+    SubmitOutcome::Success
+}
+
+/// Pull the `existingId` out of an alreadyExists SetError-wrapped
+/// error. Returns `None` for every other error class — callers use the
+/// `Option` to decide whether to enter the reconcile branch.
+fn already_exists_id_from(err: &JmapError) -> Option<String> {
+    let set_err: &SetError<String> = match err {
+        JmapError::Set(se) => se,
+        _ => return None,
+    };
+    if set_err.error() != &SetErrorType::AlreadyExists {
+        return None;
+    }
+    set_err.existing_id().map(String::from)
+}
+
+/// Handle the alreadyExists branch: query current server state for the
+/// pre-existing email, decide via `reconcile_action`, dispatch to a
+/// follow-up EmailSubmission/set. See Bug #8 in the Phase E catalog
+/// and RFC 8621 §4.9 (Email/import) + §7 (EmailSubmission).
+async fn reconcile_after_import(
+    client: &Client,
+    ctx: &SubmitContext,
+    sidecar: &SidecarState,
+    existing_email_id: &str,
+    send_at_dt: Option<DateTime<Utc>>,
+) -> SubmitOutcome {
+    info!(
+        "reconcile: Email/import alreadyExists → server holds {}; querying state",
+        existing_email_id
+    );
+
+    // Chained state fetch: Email/get(properties=[mailboxIds]) plus
+    // EmailSubmission/query filtered on this email's pending
+    // submissions. One round-trip.
+    let mut req = client.build();
+    restrict_using(&mut req);
+    {
+        let g = req.get_email();
+        g.ids([existing_email_id]);
+        g.properties([EmailProperty::MailboxIds]);
+    }
+    {
+        let q = req.query_email_submission();
+        q.account_id(&ctx.account_id);
+        q.filter(jmap_client::core::query::Filter::and([
+            email_submission::query::Filter::email_ids([existing_email_id]),
+            email_submission::query::Filter::undo_status(UndoStatus::Pending),
+        ]));
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return SubmitOutcome::from_jmap_error(e),
+    };
+
+    let mut email_mailbox_ids: Vec<String> = Vec::new();
+    let mut pending_submission_ids: Vec<String> = Vec::new();
+    for tagged in resp.unwrap_method_responses() {
+        match tagged.unwrap_method_response() {
+            MethodResponse::Error(me) => return SubmitOutcome::from_method_error(&me),
+            MethodResponse::GetEmail(mut get_resp) => {
+                if let Some(email) = get_resp.take_list().into_iter().next() {
+                    email_mailbox_ids =
+                        email.mailbox_ids().iter().map(|s| s.to_string()).collect();
+                }
+            }
+            MethodResponse::QueryEmailSubmission(mut q_resp) => {
+                pending_submission_ids = q_resp.take_ids();
+            }
+            _ => {}
+        }
+    }
+
+    let action = reconcile_action(
+        &email_mailbox_ids,
+        &pending_submission_ids,
+        &ctx.sent_id,
+        send_at_dt,
+    );
+
+    match action {
+        ReconcileAction::AlreadyDone => {
+            info!(
+                "reconcile: {existing_email_id} already in Sent — delivery finished; \
+                 sync loop will pull the Sent copy down naturally, no re-submit"
+            );
+            SubmitOutcome::Success
+        }
+        ReconcileAction::CancelAndResubmit { destroy_ids, send_at } => {
+            info!(
+                "reconcile: {existing_email_id} in Drafts with {} pending submission(s); \
+                 destroying old + creating fresh (sendAt={send_at:?})",
+                destroy_ids.len()
+            );
+            execute_reconciled_submission(
+                client,
+                ctx,
+                sidecar,
+                existing_email_id,
+                send_at,
+                Some(destroy_ids),
+            )
+            .await
+        }
+        ReconcileAction::CreateSubmission { send_at } => {
+            info!(
+                "reconcile: {existing_email_id} in Drafts, no pending submission; \
+                 creating fresh (sendAt={send_at:?})"
+            );
+            execute_reconciled_submission(
+                client,
+                ctx,
+                sidecar,
+                existing_email_id,
+                send_at,
+                None,
+            )
+            .await
+        }
+    }
+}
+
+/// Send an EmailSubmission/set that references an already-imported
+/// email by server id — no #i0 creation-ref, since the email is on the
+/// server. Optionally destroys pending submissions in the same request
+/// (per RFC 8620 §5.3, `destroy` runs before `create`, so the new one
+/// takes effect immediately). Files to Sent on success via the same
+/// `onSuccessUpdateEmail` shape as the normal path.
+async fn execute_reconciled_submission(
+    client: &Client,
+    ctx: &SubmitContext,
+    sidecar: &SidecarState,
+    email_id: &str,
+    send_at: Option<DateTime<Utc>>,
+    destroy_ids: Option<Vec<String>>,
+) -> SubmitOutcome {
+    let mut req = client.build();
+    restrict_using(&mut req);
+
+    let submission_create_id = {
+        let set_req = req.set_email_submission();
+        if let Some(ids) = &destroy_ids {
+            set_req.destroy(ids.iter().map(String::as_str));
+        }
+        let create = set_req.create();
+        create.email_id(email_id);
+        create.identity_id(&ctx.identity_id);
+        create.envelope(
+            sidecar.envelope.from.as_str(),
+            sidecar
+                .envelope
+                .to
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+        );
+        if let Some(dt) = send_at {
+            create.send_at(dt);
+        }
+        create.create_id().unwrap_or_else(|| "c0".to_string())
+    };
+
+    let file_target = ctx.file_target_id(send_at.is_some()).to_string();
+    {
+        let set_req = req.set_email_submission();
+        let args = set_req.arguments();
+        let update = args.on_success_update_email(&submission_create_id);
+        update.mailbox_id(&ctx.drafts_id, false);
+        update.mailbox_id(&file_target, true);
+        update.keyword("$draft", false);
+        update.keyword("$seen", true);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return SubmitOutcome::from_jmap_error(e),
+    };
+    for tagged in resp.unwrap_method_responses() {
+        match tagged.unwrap_method_response() {
+            MethodResponse::Error(me) => return SubmitOutcome::from_method_error(&me),
+            MethodResponse::SetEmailSubmission(set_resp) => {
+                if let Err(e) = set_resp.unwrap_create_errors() {
+                    return SubmitOutcome::Permanent(format!(
+                        "EmailSubmission/set (reconcile): {e}"
+                    ));
+                }
+                if !set_resp.has_created() {
+                    return SubmitOutcome::Permanent(
+                        "EmailSubmission/set (reconcile) returned no created entry".into(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
     SubmitOutcome::Success
 }
 
