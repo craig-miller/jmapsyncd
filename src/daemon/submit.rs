@@ -692,19 +692,29 @@ async fn submit_one(
     };
 
     // EmailSubmission/set: reference the just-imported email by
-    // creation-id (`#i0`); set identity + envelope + optional sendAt.
+    // creation-id (`#i0`); set identity + envelope + optional sendAt +
+    // holdUntil MAIL FROM parameter (RFC 4865 FUTURERELEASE — Fastmail
+    // rejects a bare `sendAt` with `invalidProperties: sendAt` unless
+    // it's paired with `envelope.mailFrom.parameters.holdUntil` at the
+    // same timestamp); and, on that create's success, atomically file
+    // the email to Sent (or the Scheduled folder for delayed sends)
+    // and flip its keywords. All of it must land on ONE method call —
+    // an orphan onSuccessUpdateEmail referencing `#c0` from a
+    // previous call is rejected at the method level.
+    let file_target = ctx.file_target_id(send_at_dt.is_some()).to_string();
+    let set_req = req.set_email_submission();
     let submission_create_id = {
-        let set_req = req.set_email_submission();
         let create = set_req.create();
         create.email_id(format!("#{}", email_create_id));
         create.identity_id(&ctx.identity_id);
+        let mail_from = build_mail_from(sidecar.envelope.from.as_str(), send_at_dt);
         create.envelope(
-            sidecar.envelope.from.as_str(),
+            mail_from,
             sidecar
                 .envelope
                 .to
                 .iter()
-                .map(|s| s.as_str())
+                .map(|s| jmap_client::email_submission::Address::<jmap_client::Set>::new(s.as_str()))
                 .collect::<Vec<_>>(),
         );
         if let Some(dt) = send_at_dt {
@@ -712,12 +722,7 @@ async fn submit_one(
         }
         create.create_id().unwrap_or_else(|| "c0".to_string())
     };
-
-    // onSuccessUpdateEmail: file into Sent (or Scheduled folder),
-    // clear the Drafts placement, drop $draft, add $seen.
-    let file_target = ctx.file_target_id(send_at_dt.is_some()).to_string();
     {
-        let set_req = req.set_email_submission();
         let args = set_req.arguments();
         let update = args.on_success_update_email(&submission_create_id);
         update.mailbox_id(&ctx.drafts_id, false);
@@ -727,6 +732,12 @@ async fn submit_one(
     }
 
     // ---- Send + interpret -------------------------------------------
+    if std::env::var("JMAPSYNCD_WIRE_DEBUG").is_ok() {
+        match serde_json::to_string_pretty(&req) {
+            Ok(json) => debug!(target: "jmapsyncd::wire", "outgoing JMAP request:\n{}", json),
+            Err(e)   => debug!(target: "jmapsyncd::wire", "could not serialize request: {e}"),
+        }
+    }
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => return SubmitOutcome::from_jmap_error(e),
@@ -861,6 +872,12 @@ async fn reconcile_after_import(
         ]));
     }
 
+    if std::env::var("JMAPSYNCD_WIRE_DEBUG").is_ok() {
+        match serde_json::to_string_pretty(&req) {
+            Ok(json) => debug!(target: "jmapsyncd::wire", "outgoing JMAP request:\n{}", json),
+            Err(e)   => debug!(target: "jmapsyncd::wire", "could not serialize request: {e}"),
+        }
+    }
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => return SubmitOutcome::from_jmap_error(e),
@@ -950,21 +967,23 @@ async fn execute_reconciled_submission(
     let mut req = client.build();
     restrict_using(&mut req);
 
+    let file_target = ctx.file_target_id(send_at.is_some()).to_string();
+    let set_req = req.set_email_submission();
+    if let Some(ids) = &destroy_ids {
+        set_req.destroy(ids.iter().map(String::as_str));
+    }
     let submission_create_id = {
-        let set_req = req.set_email_submission();
-        if let Some(ids) = &destroy_ids {
-            set_req.destroy(ids.iter().map(String::as_str));
-        }
         let create = set_req.create();
         create.email_id(email_id);
         create.identity_id(&ctx.identity_id);
+        let mail_from = build_mail_from(sidecar.envelope.from.as_str(), send_at);
         create.envelope(
-            sidecar.envelope.from.as_str(),
+            mail_from,
             sidecar
                 .envelope
                 .to
                 .iter()
-                .map(|s| s.as_str())
+                .map(|s| jmap_client::email_submission::Address::<jmap_client::Set>::new(s.as_str()))
                 .collect::<Vec<_>>(),
         );
         if let Some(dt) = send_at {
@@ -972,10 +991,7 @@ async fn execute_reconciled_submission(
         }
         create.create_id().unwrap_or_else(|| "c0".to_string())
     };
-
-    let file_target = ctx.file_target_id(send_at.is_some()).to_string();
     {
-        let set_req = req.set_email_submission();
         let args = set_req.arguments();
         let update = args.on_success_update_email(&submission_create_id);
         update.mailbox_id(&ctx.drafts_id, false);
@@ -984,6 +1000,12 @@ async fn execute_reconciled_submission(
         update.keyword("$seen", true);
     }
 
+    if std::env::var("JMAPSYNCD_WIRE_DEBUG").is_ok() {
+        match serde_json::to_string_pretty(&req) {
+            Ok(json) => debug!(target: "jmapsyncd::wire", "outgoing JMAP request:\n{}", json),
+            Err(e)   => debug!(target: "jmapsyncd::wire", "could not serialize request: {e}"),
+        }
+    }
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => return SubmitOutcome::from_jmap_error(e),
@@ -1346,6 +1368,25 @@ struct Envelope {
     from: String,
     #[serde(default)]
     to: Vec<String>,
+}
+
+/// Build an `Address<Set>` for the envelope MAIL FROM. When `send_at`
+/// is present, attaches the RFC 4865 ESMTP FUTURERELEASE `holdUntil`
+/// parameter with the same timestamp; without it Fastmail rejects
+/// `EmailSubmission/set` create as `invalidProperties: sendAt`.
+fn build_mail_from(
+    email: &str,
+    send_at: Option<DateTime<Utc>>,
+) -> jmap_client::email_submission::Address<jmap_client::Set> {
+    let addr = jmap_client::email_submission::Address::<jmap_client::Set>::new(email);
+    if let Some(dt) = send_at {
+        addr.parameter(
+            "holdUntil",
+            Some(dt.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        )
+    } else {
+        addr
+    }
 }
 
 /// Pre-submit envelope sanity check. Returns `Some(reason)` if the
