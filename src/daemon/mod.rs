@@ -2,6 +2,7 @@ use crate::config::Account;
 use crate::db::Database;
 use crate::sync;
 
+mod single_instance;
 mod submit;
 use futures_util::StreamExt;
 use jmap_client::DataType;
@@ -282,6 +283,12 @@ async fn sleep_or_cancel(d: Duration, cancel: &CancellationToken) {
 /// Bad client-build for one account is logged and skipped, not fatal —
 /// a single misconfigured account shouldn't take the daemon down.
 pub async fn run_daemon(config: Config) -> anyhow::Result<()> {
+    // Single-instance guard. Held for the full daemon lifetime; the
+    // kernel releases the flock automatically when the process exits,
+    // including on SIGKILL. See  module header for why.
+    let _lock = single_instance::acquire()?;
+    info!("[daemon] acquired single-instance lock (pid={})", std::process::id());
+
     // Database (rusqlite Connection) is !Sync, so the sync_account futures
     // aren't Send. Run all account tasks on a LocalSet — single-threaded
     // per-thread, non-Send futures OK. In practice each account is fully

@@ -29,6 +29,8 @@ mailparse = "0.16"
 ulid = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hostname = "0.4"
+# Advisory POSIX flock for single-instance daemon guard.
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
