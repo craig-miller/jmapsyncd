@@ -10,6 +10,8 @@ JMAP ↔ Maildir sync daemon.
 
 ```bash
 cargo install --path .
+install -Dm0644 contrib/icons/network-connected-symbolic.svg \
+  "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/status/network-connected-symbolic.svg"
 
 mkdir -p ~/.config/jmapsyncd
 cat > ~/.config/jmapsyncd/config.toml << 'EOF'
@@ -81,6 +83,6 @@ A stack of single-purpose, rebase-friendly commits on top of upstream:
 
 1. **`jmap-client` 0.2 → 0.4.2 migration.** Bumps the Stalwart JMAP client library to its current release. Needed by the SSE-push loop and incremental `Email/changes` fetch below.
 2. **Task 3: core sync engine.** `sync_mailboxes` — three-way diff of the mailbox tree against `Mailbox/get` / `Mailbox/changes`. `sync_emails` — per-mailbox `Email/query` + `Email/get` + `Blob/download`, JMAP-keyword ↔ Maildir-flag mapping (`$seen`/`$flagged`/`$answered`/`$draft` → `S`/`F`/`R`/`D`), primary-mailbox selection per PLAN.md's role priority. Mirror-strict deletion (server delete → local delete); btrfs snapshots are the safety net.
-3. **Task 4: daemon loop + SSE + fallback polling.** Per-account `tokio` task combining `EventSource` push notifications with a `poll_interval_secs` timer (default 300s, zero disables). Graceful `SIGTERM` / `SIGINT` shutdown via `tokio::signal` + a shared `CancellationToken`. `sync` one-shot with `--dry-run`.
+3. **Task 4: daemon loop + SSE + fallback polling.** Per-account `tokio` task combining `EventSource` push notifications with a `poll_interval_secs` timer (default 300s, zero disables). Account startup, SSE reconnection, and submission workers survive transient failures with capped exponential backoff. On Linux, `nm-online` pauses retries while NetworkManager reports the machine offline, and each failed worker uses `notify-send` once when it enters the failed state and again when it recovers; both tools are optional and timed retry remains the fallback. Graceful `SIGTERM` / `SIGINT` shutdown uses `tokio::signal` + a shared `CancellationToken`. `sync` one-shot supports `--dry-run`.
 
 Landing intent: upstream PRs (one per phase) as they mature. This branch remains the shipping cut for the [zentoo overlay](https://github.com/craig-miller/zentoo-overlay)'s `net-mail/jmapsyncd` ebuild until upstream cuts a release.

@@ -2,6 +2,7 @@ use crate::config::Account;
 use crate::db::Database;
 use crate::sync;
 
+mod resilience;
 mod single_instance;
 mod submit;
 use futures_util::StreamExt;
@@ -20,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 
-const SSE_CONNECT_BACKOFF: Duration = Duration::from_secs(5);
+const ACCOUNT_RETRY_BASE: Duration = Duration::from_secs(5);
+const ACCOUNT_RETRY_CAP: Duration = Duration::from_secs(300);
 const SSE_STREAM_DROP_BACKOFF: Duration = Duration::from_secs(1);
 const SSE_PING_SECONDS: u32 = 60;
 const MAILDIR_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -39,6 +41,11 @@ pub async fn run_account_sse_loop(
 ) {
     let acct_name = acct.name.clone();
     let mut last_event_id: Option<String> = None;
+    let mut retry_backoff = resilience::RetryBackoff::new(
+        ACCOUNT_RETRY_BASE,
+        ACCOUNT_RETRY_CAP,
+    );
+    let mut failure_notifier = resilience::FailureNotifier::new(&acct_name, &acct.jmap_host);
 
     // Optional Maildir watcher — the local-side counterpart to SSE. Fires
     // a sync tick whenever anything under the Maildir tree changes so that
@@ -82,15 +89,21 @@ pub async fn run_account_sse_loop(
         let mut stream = match stream_result {
             Ok(s) => s,
             Err(e) => {
+                let delay = retry_backoff.take_delay();
                 warn!(
-                    "[{acct_name}] SSE connect failed: {e:#}; retry in {}s",
-                    SSE_CONNECT_BACKOFF.as_secs()
+                    "[{acct_name}] SSE connect failed: {e:#}; waiting for connectivity or retrying in {}s",
+                    delay.as_secs()
                 );
-                sleep_or_cancel(SSE_CONNECT_BACKOFF, &cancel).await;
+                failure_notifier.failed().await;
+                if !resilience::wait_for_connectivity_or_delay(delay, &cancel).await {
+                    return;
+                }
                 continue;
             }
         };
 
+        retry_backoff.reset();
+        failure_notifier.recovered().await;
         info!("[{acct_name}] SSE connected");
 
         // Polling fallback timer — fires every poll_interval_secs while
@@ -107,6 +120,7 @@ pub async fn run_account_sse_loop(
             None
         };
 
+        let mut reconnect_after_failure = false;
         loop {
             tokio::select! {
                 biased;
@@ -135,6 +149,8 @@ pub async fn run_account_sse_loop(
                         }
                         Some(Err(e)) => {
                             warn!("[{acct_name}] SSE stream error: {e:#}; reconnecting");
+                            failure_notifier.failed().await;
+                            reconnect_after_failure = true;
                             break;
                         }
                         Some(Ok(PushNotification::StateChange(chg))) => {
@@ -154,7 +170,14 @@ pub async fn run_account_sse_loop(
             }
         }
 
-        sleep_or_cancel(SSE_STREAM_DROP_BACKOFF, &cancel).await;
+        if reconnect_after_failure {
+            let delay = retry_backoff.take_delay();
+            if !resilience::wait_for_connectivity_or_delay(delay, &cancel).await {
+                return;
+            }
+        } else {
+            sleep_or_cancel(SSE_STREAM_DROP_BACKOFF, &cancel).await;
+        }
     }
 }
 
@@ -280,8 +303,9 @@ async fn sleep_or_cancel(d: Duration, cancel: &CancellationToken) {
 /// waits for SIGTERM or SIGINT, then fires the shared CancellationToken
 /// so every task exits cleanly.
 ///
-/// Bad client-build for one account is logged and skipped, not fatal —
-/// a single misconfigured account shouldn't take the daemon down.
+/// Client setup for each account is supervised independently. A transient
+/// startup failure is visible to the user and retries without taking down the
+/// daemon or preventing other accounts from running.
 pub async fn run_daemon(config: Config) -> anyhow::Result<()> {
     // Single-instance guard. Held for the full daemon lifetime; the
     // kernel releases the flock automatically when the process exits,
@@ -296,6 +320,63 @@ pub async fn run_daemon(config: Config) -> anyhow::Result<()> {
     // single-threading is fine for the account counts we expect (1-3).
     let local = LocalSet::new();
     local.run_until(run_daemon_inner(config)).await
+}
+
+async fn run_account_supervisor(acct: Account, db: Database, cancel: CancellationToken) {
+    let acct_name = acct.name.clone();
+    let mut retry_backoff =
+        resilience::RetryBackoff::new(ACCOUNT_RETRY_BASE, ACCOUNT_RETRY_CAP);
+    let mut failure_notifier = resilience::FailureNotifier::new(&acct_name, &acct.jmap_host);
+
+    let client = loop {
+        let result = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = crate::jmap::client_from_account(&acct) => result,
+        };
+
+        match result {
+            Ok(client) => {
+                retry_backoff.reset();
+                failure_notifier.recovered().await;
+                break Arc::new(client);
+            }
+            Err(error) => {
+                let delay = retry_backoff.take_delay();
+                log::error!(
+                    "[{acct_name}] JMAP client setup failed: {error:#}; waiting for connectivity or retrying in {}s",
+                    delay.as_secs()
+                );
+                failure_notifier.failed().await;
+                if !resilience::wait_for_connectivity_or_delay(delay, &cancel).await {
+                    return;
+                }
+            }
+        }
+    };
+
+    // Send-path Phase E: if the account has [accounts.submit], spawn a
+    // second per-account task that watches Outbox/ + Failed/. Both tasks
+    // share one authenticated client and connection pool.
+    let submit_handle = if acct.submit.is_some() {
+        let submit_cancel = cancel.child_token();
+        let submit_acct = acct.clone();
+        let submit_client = Arc::clone(&client);
+        let submit_name = acct_name.clone();
+        Some(spawn_local(async move {
+            submit::run_account_submit_loop(submit_client, submit_acct, submit_cancel).await;
+            log::info!("[{submit_name}/submit] task exited");
+        }))
+    } else {
+        None
+    };
+
+    run_account_sse_loop(client, acct, db, cancel).await;
+    if let Some(handle) = submit_handle {
+        match handle.await {
+            Ok(()) => {}
+            Err(error) => log::error!("[{acct_name}/submit] task join error: {error}"),
+        }
+    }
 }
 
 async fn run_daemon_inner(config: Config) -> anyhow::Result<()> {
@@ -336,39 +417,11 @@ async fn run_daemon_inner(config: Config) -> anyhow::Result<()> {
             }
         };
 
-        let client = match crate::jmap::client_from_account(&acct).await {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                log::error!(
-                    "[{}] failed to authenticate JMAP client: {e:#}; skipping account",
-                    acct.name
-                );
-                continue;
-            }
-        };
-
-        // Send-path Phase E: if the account has [accounts.submit], spawn
-        // a second per-account task that watches Outbox/ + Failed/ and
-        // drives the real JMAP submission chain. Both tasks share the
-        // same Arc<Client> — same auth session, same connection pool,
-        // single pinentry prompt on startup.
-        if acct.submit.is_some() {
-            let submit_cancel = cancel.child_token();
-            let submit_acct = acct.clone();
-            let submit_client = Arc::clone(&client);
-            let submit_name = acct.name.clone();
-            let submit_handle = spawn_local(async move {
-                submit::run_account_submit_loop(submit_client, submit_acct, submit_cancel).await;
-                log::info!("[{submit_name}/submit] task exited");
-            });
-            handles.push(submit_handle);
-        }
-
         let task_cancel = cancel.child_token();
         let acct_name = acct.name.clone();
         let handle = spawn_local(async move {
-            run_account_sse_loop(client, acct, db, task_cancel).await;
-            log::info!("[{acct_name}] task exited");
+            run_account_supervisor(acct, db, task_cancel).await;
+            log::info!("[{acct_name}] supervised account task exited");
         });
         handles.push(handle);
         spawned += 1;

@@ -45,9 +45,10 @@
 //!   `X-JMAP-Ulid`): injected only on a permanent-failure move to
 //!   Failed/, stripped on drag-back. Never visible on the wire.
 
+use super::resilience;
 use crate::config::{Account, ScheduledFolder, SubmitConfig};
 use crate::jmap::restrict_using;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, SecondsFormat, Utc};
 use jmap_client::{
     client::Client,
@@ -84,6 +85,8 @@ use ulid::Ulid;
 
 /// Debounce window for coalescing rapid same-file inotify events.
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(100);
+const LOOP_RETRY_BASE: Duration = Duration::from_secs(5);
+const LOOP_RETRY_CAP: Duration = Duration::from_secs(300);
 
 /// How long a `RenameFrom` event waits for its paired `RenameTo`
 /// before we give up and treat the from-event as a plain remove.
@@ -108,17 +111,42 @@ const BACKOFF_ATTEMPT_CAP: u32 = 30;
 // ---------------------------------------------------------------------------
 
 /// Per-account outbox watcher. Long-running; returns when `cancel` fires.
-/// A bring-up failure (no identity match, no drafts folder, watcher setup
-/// error) is logged and the loop returns — one broken account should not
-/// tear the daemon down.
+/// Bring-up and watcher failures are supervised with connectivity-aware
+/// exponential backoff so a temporary outage cannot permanently disable
+/// queued submission.
 pub async fn run_account_submit_loop(
     client: Arc<Client>,
     acct: Account,
     cancel: CancellationToken,
 ) {
     let acct_name = acct.name.clone();
-    if let Err(e) = run_account_submit_loop_inner(client, acct, cancel).await {
-        error!("[{acct_name}/submit] loop terminated: {e:#}");
+    let mut retry_backoff = resilience::RetryBackoff::new(LOOP_RETRY_BASE, LOOP_RETRY_CAP);
+    let mut failure_notifier = resilience::FailureNotifier::new(&acct_name, &acct.jmap_host);
+
+    loop {
+        let result = run_account_submit_loop_inner(
+            Arc::clone(&client),
+            acct.clone(),
+            cancel.clone(),
+            &mut failure_notifier,
+            &mut retry_backoff,
+        )
+        .await;
+
+        if cancel.is_cancelled() {
+            return;
+        }
+
+        match result {
+            Ok(()) => warn!("[{acct_name}/submit] loop stopped unexpectedly"),
+            Err(error) => error!("[{acct_name}/submit] loop terminated: {error:#}"),
+        }
+        failure_notifier.failed().await;
+
+        let delay = retry_backoff.take_delay();
+        if !resilience::wait_for_connectivity_or_delay(delay, &cancel).await {
+            return;
+        }
     }
 }
 
@@ -126,6 +154,8 @@ async fn run_account_submit_loop_inner(
     client: Arc<Client>,
     acct: Account,
     cancel: CancellationToken,
+    failure_notifier: &mut resilience::FailureNotifier,
+    retry_backoff: &mut resilience::RetryBackoff,
 ) -> Result<()> {
     let acct_name = acct.name.clone();
 
@@ -157,8 +187,11 @@ async fn run_account_submit_loop_inner(
     // Resolve identity + mailbox ids up-front. Fail-fast if the config
     // doesn't match anything on the server — better to know at startup
     // than at first submit.
-    let ctx = SubmitContext::resolve(&client, submit_cfg).await
+    let ctx = SubmitContext::resolve(&client, submit_cfg)
+        .await
         .with_context(|| format!("[{acct_name}] resolve submit context"))?;
+    retry_backoff.reset();
+    failure_notifier.recovered().await;
     info!(
         "[{acct_name}/submit] context: identity={} drafts={} sent={} scheduled={}",
         ctx.identity_id,
@@ -233,7 +266,7 @@ async fn run_account_submit_loop_inner(
                         &client, &ctx, submit_cfg,
                         &sidecar_dir, &outbox, &failed,
                         &basename, &mut retry_queue,
-                        &acct_name,
+                        &acct_name, &cancel, failure_notifier,
                     ).await;
                 }
             }
@@ -566,6 +599,8 @@ async fn handle_submit_attempt(
     basename: &str,
     retry_queue: &mut RetrySchedule,
     acct_name: &str,
+    cancel: &CancellationToken,
+    failure_notifier: &mut resilience::FailureNotifier,
 ) {
     let (msg_path, msg_bytes) = match locate_and_read_outbox_message(outbox, basename) {
         Ok(x) => x,
@@ -587,6 +622,7 @@ async fn handle_submit_attempt(
 
     match outcome {
         SubmitOutcome::Success => {
+            failure_notifier.recovered().await;
             info!("[{acct_name}/submit] {basename}: submitted");
             let _ = std::fs::remove_file(&msg_path);
             let _ = std::fs::remove_file(sidecar_dir.join(format!("{basename}.json")));
@@ -612,7 +648,10 @@ async fn handle_submit_attempt(
                 "[{acct_name}/submit] {basename}: transient (attempt={attempts}, next in {}s) — {reason}",
                 delay.as_secs()
             );
-            retry_queue.schedule(basename.to_string(), Instant::now() + delay);
+            failure_notifier.failed().await;
+            if resilience::wait_for_connectivity_or_delay(delay, cancel).await {
+                retry_queue.schedule(basename.to_string(), Instant::now());
+            }
         }
         SubmitOutcome::Permanent(reason) => {
             error!("[{acct_name}/submit] {basename}: permanent — {reason}");
